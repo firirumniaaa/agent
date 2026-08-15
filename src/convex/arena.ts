@@ -590,6 +590,542 @@ export const debugAuth = action({
   },
 });
 
+// ====== DEBUG: signup arena via magic-link + email sementara (mail.tm) ======
+
+const MAIL_TM = "https://api.mail.tm";
+
+function randomAddress(): string {
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let s = "arena";
+  for (let i = 0; i < 10; i++) {
+    s += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return `${s}@emalupe.com`;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export const debugTempSignup = action({
+  args: {},
+  handler: async (): Promise<Record<string, unknown>> => {
+    // 1) Buat mailbox sementara
+    const address = randomAddress();
+    const password = "TempPass!" + Math.random().toString(36).slice(2, 10);
+    let createRes: Response;
+    try {
+      createRes = await fetch(`${MAIL_TM}/accounts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address, password }),
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch (error) {
+      return { error: `mail.tm create gagal: ${String(error)}` };
+    }
+    if (createRes.status !== 201) {
+      return { error: `mail.tm create: HTTP ${createRes.status} ${(await createRes.text()).slice(0, 200)}` };
+    }
+
+    // 2) Kirim magic-link arena
+    const signupPayload = {
+      email: address,
+      fullName: "Test Arena",
+      shouldLinkHistory: false,
+      marketingConsent: false,
+      registeredCountryCode: "ID",
+    };
+    let magicRes: Response;
+    try {
+      magicRes = await fetch(`${BASE}/nextjs-api/sign-up/magic-link`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": UA,
+          Origin: BASE,
+          Referer: BASE + "/agent",
+        },
+        body: JSON.stringify(signupPayload),
+        signal: AbortSignal.timeout(20_000),
+      });
+    } catch (error) {
+      return { address, error: `magic-link fetch gagal: ${String(error)}` };
+    }
+    const magicBody = (await magicRes.text()).slice(0, 300);
+    return { address, password, magicStatus: magicRes.status, magicBody };
+  },
+});
+
+/**
+ * Tahap 2: ambil email verifikasi dari mailbox, klik link callback dari server,
+ * tangkap cookie sesi, lalu tes create-chat dengan sesi baru (dibuat dari IP server).
+ */
+export const debugVerifyAndChat = action({
+  args: { address: v.string(), password: v.string() },
+  handler: async (ctx, { address, password }): Promise<Record<string, unknown>> => {
+    // 1) Token mail.tm
+    let token = "";
+    try {
+      const tRes = await fetch(`${MAIL_TM}/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address, password }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      const tBody = (await tRes.json()) as { token?: string };
+      token = tBody.token ?? "";
+    } catch {
+      // ignore
+    }
+
+    // 2) Poll inbox sampai ada email dari arena
+    let callbackUrl = "";
+    const polls = [];
+    for (let i = 0; i < 6; i++) {
+      await sleep(5000);
+      try {
+        const mRes = await fetch(`${MAIL_TM}/messages`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(15_000),
+        });
+        const mBody = (await mRes.json()) as {
+          "hydra:member"?: Array<{ id: string; subject?: string }>;
+        };
+        const members = mBody["hydra:member"] ?? [];
+        polls.push({ poll: i, count: members.length });
+        if (members.length > 0) {
+          const first = members[0];
+          const dRes = await fetch(`${MAIL_TM}/messages/${first.id}`, {
+            headers: { Authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(15_000),
+          });
+          const detail = (await dRes.json()) as { text?: string };
+          const match = (detail.text ?? "").match(
+            /https:\/\/arena\.ai\/nextjs-api\/callback\/[^\s]+/,
+          );
+          if (match) {
+            callbackUrl = match[0];
+            break;
+          }
+        }
+      } catch (error) {
+        polls.push({ poll: i, error: String(error) });
+      }
+    }
+
+    if (!callbackUrl) {
+      return { error: "Email verifikasi belum tiba / link tidak ditemukan.", polls };
+    }
+
+    // 3) Klik callback dari server, tangkap cookie sesi (ikuti redirect manual)
+    const cookies: string[] = [];
+    let current = callbackUrl;
+    const hops = [];
+    let setPasswordFullLocation = "";
+    for (let i = 0; i < 6; i++) {
+      const res = await fetch(current, {
+        redirect: "manual",
+        headers: {
+          "User-Agent": UA,
+          Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+      const setCookie = res.headers.get("set-cookie");
+      const location = res.headers.get("location");
+      const cookiePairs = (setCookie ?? "").split(",").map((c) => c.split(";")[0]);
+      for (const pair of cookiePairs) {
+        if (pair && !cookies.includes(pair)) cookies.push(pair);
+      }
+      hops.push({
+        hop: i,
+        status: res.status,
+        location: location?.slice(0, 120) ?? null,
+        setCookieCount: cookiePairs.filter(Boolean).length,
+        bodyPreview: (await res.text()).slice(0, 120),
+      });
+      if (location) {
+        if (location.includes("/auth/set-password")) {
+          setPasswordFullLocation = new URL(location, current).toString();
+        }
+        current = new URL(location, current).toString();
+      } else {
+        break;
+      }
+    }
+
+    const cookieString = cookies.join("; ");
+    const provisionalMatch = cookieString.match(/provisional_user_id=([^;]+)/);
+    const provisionalUserId = provisionalMatch?.[1] ?? "";
+    const setPasswordToken =
+      setPasswordFullLocation.match(/token=([^&]+)/)?.[1] ?? "";
+
+    const accountResults: Record<string, unknown>[] = [];
+    let sessionCookie = cookieString;
+    const setPassword = Math.random().toString(36).slice(2, 10) + "ArenaTemp!";
+
+    // Urutan yang benar (meniru browser):
+    //   1) set-password DULU (buat user email + cookie v1.0/v1.1)
+    //   2) sign-up dengan provisionalUserId ASLI dari callback (buat row arena
+    //      untuk user email tsb — persis yang dilakukan halaman agent saat
+    //      userState === "provisional").
+
+    // 4a) Tautkan email: POST /nextjs-api/auth/set-password (token JWT dari
+    //     callback) dengan cookie provisional.
+    if (setPasswordToken) {
+      const spRes = await fetch(`${BASE}/nextjs-api/auth/set-password`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": UA,
+          Origin: BASE,
+          Referer: BASE + "/agent",
+          Cookie: sessionCookie,
+        },
+        body: JSON.stringify({ password: setPassword, token: setPasswordToken }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      const spBody = await spRes.text();
+      if (spRes.ok) {
+        const spCookie = spRes.headers.get("set-cookie") ?? "";
+        const spPairs = spCookie
+          .split(",")
+          .map((c: string) => c.split(";")[0])
+          .filter((c: string) => c && !cookies.includes(c));
+        for (const p of spPairs) cookies.push(p);
+        sessionCookie = cookies.join("; ");
+      }
+      accountResults.push({
+        step: "set-password",
+        status: spRes.status,
+        setCookieCount: spRes.headers.get("set-cookie")?.split(",").length ?? 0,
+        body: spBody.slice(0, 300),
+      });
+    }
+
+    // 4b) Buat row arena untuk user email: POST /nextjs-api/sign-up dengan
+    //     provisionalUserId ASLI dari callback (cookie provisional_user_id),
+    //     memakai sesi terbaru (v1.0/v1.1).
+    if (provisionalUserId) {
+      const recaptchaToken = await mintRecaptchaToken();
+      if (recaptchaToken) {
+        const res = await fetch(`${BASE}/nextjs-api/sign-up`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": UA,
+            Origin: BASE,
+            Referer: BASE + "/agent",
+            Cookie: sessionCookie,
+          },
+          body: JSON.stringify({ recaptchaToken, provisionalUserId }),
+          signal: AbortSignal.timeout(20_000),
+        });
+        const setCookie = res.headers.get("set-cookie") ?? "";
+        const newPairs = setCookie
+          .split(",")
+          .map((c: string) => c.split(";")[0])
+          .filter((c: string) => c && !cookies.includes(c));
+        for (const p of newPairs) cookies.push(p);
+        sessionCookie = cookies.join("; ");
+        accountResults.push({
+          step: "sign-up-after-set-password",
+          status: res.status,
+          setCookieCount: newPairs.length,
+          body: (await res.text()).slice(0, 300),
+        });
+      }
+    }
+
+    // 5) Simpan sesi baru
+    await ctx.runMutation(internal.arenaSession.upsert, {
+      clientId: "temp-mail-session",
+      cookie: sessionCookie,
+      name: "Temp Mail",
+      email: address,
+    });
+
+    // 6) Tes /api/me + create-chat dengan sesi baru
+    const meRes = await fetch(`${BASE}/api/me`, {
+      headers: {
+        "User-Agent": UA,
+        Accept: "application/json, text/event-stream, */*",
+        Origin: BASE,
+        Referer: BASE + "/agent",
+        Cookie: sessionCookie,
+      },
+      signal: AbortSignal.timeout(15_000),
+    });
+    const meBody = await meRes.text();
+
+    const recaptchaToken2 = await mintRecaptchaToken();
+    let chatResult: Record<string, unknown> = {};
+    if (recaptchaToken2) {
+      const res = await createChatWithCookie(
+        sessionCookie,
+        recaptchaToken2,
+        "halo, tes sesi dari email sementara",
+        "https://arena.ai",
+      );
+      chatResult = { status: res.status, body: res.body };
+    }
+
+    return {
+      address,
+      callbackUrl: callbackUrl.slice(0, 80),
+      provisionalUserId,
+      hasSetPasswordToken: Boolean(setPasswordToken),
+      accountResults,
+      meStatus: meRes.status,
+      meBody: meBody.slice(0, 200),
+      cookieNames: cookies.map((c) => c.split("=")[0]),
+      chatResult,
+    };
+  },
+});
+
+// Tes sesi temp (arena-auth-prod-v1 vs v1.0/v1.1) terhadap /api/me + create-chat
+export const debugTempSessionTest = action({
+  args: {},
+  handler: async (ctx): Promise<Record<string, unknown>> => {
+    const session: FirstSession = await ctx.runQuery(
+      internal.arenaSession.firstSession,
+      {},
+    );
+    if (!session || !session.cookie.includes("arena-auth-prod")) {
+      return { error: "Sesi temp belum tersimpan (jalankan debugVerifyAndChat dulu)." };
+    }
+
+    const v10 = session.cookie.match(/arena-auth-prod-v1\.0=([^;]+)/)?.[1] ?? "";
+    const v11 = session.cookie.match(/arena-auth-prod-v1\.1=([^;]+)/)?.[1] ?? "";
+
+    // Decode payload v1.0 (base64-<json dengan access_token>)
+    let innerAccess = "";
+    let innerRefresh = "";
+    let v10Json = null;
+    try {
+      if (v10.startsWith("base64-")) {
+        const b64 = v10
+          .slice(7)
+          .replace(/-/g, "+")
+          .replace(/_/g, "/")
+          .padEnd(Math.ceil(v10.length / 4) * 4, "=");
+        v10Json = JSON.parse(
+          Buffer.from(b64, "base64").toString("utf-8"),
+        ) as Record<string, unknown>;
+        innerAccess = (v10Json.access_token as string) ?? "";
+        innerRefresh = (v10Json.refresh_token as string) ?? "";
+      }
+    } catch (error) {
+      v10Json = { decodeError: String(error) };
+    }
+
+    // Decode user id dari JWT access token (bagian payload)
+    let accessPayload: Record<string, unknown> | null = null;
+    try {
+      const parts = innerAccess.split(".");
+      if (parts.length === 3) {
+        const b64 = parts[1]
+          .replace(/-/g, "+")
+          .replace(/_/g, "/")
+          .padEnd(Math.ceil(parts[1].length / 4) * 4, "=");
+        accessPayload = JSON.parse(
+          Buffer.from(b64, "base64").toString("utf-8"),
+        ) as Record<string, unknown>;
+      }
+    } catch {
+      // ignore
+    }
+
+    // Decode user id dari cookie v1 (sesi anonim)
+    const v1old = session.cookie.match(/arena-auth-prod-v1=([^;]+)/)?.[1] ?? "";
+    let v1Json: Record<string, unknown> | null = null;
+    try {
+      if (v1old.startsWith("base64-")) {
+        const b64 = v1old
+          .slice(7)
+          .replace(/-/g, "+")
+          .replace(/_/g, "/")
+          .padEnd(Math.ceil(v1old.length / 4) * 4, "=");
+        v1Json = JSON.parse(
+          Buffer.from(b64, "base64").toString("utf-8"),
+        ) as Record<string, unknown>;
+      }
+    } catch {
+      // ignore
+    }
+
+    const variants: Array<{ name: string; cookie: string }> = [
+      { name: "as-stored", cookie: session.cookie },
+      {
+        name: "only-v1.0+v1.1",
+        cookie: `arena-auth-prod-v1.0=${v10}; arena-auth-prod-v1.1=${v11}`,
+      },
+      {
+        name: "v1.0-only",
+        cookie: `arena-auth-prod-v1.0=${v10}`,
+      },
+      {
+        name: "v1.0=raw-access-jwt",
+        cookie: `arena-auth-prod-v1.0=${innerAccess}; arena-auth-prod-v1.1=${innerRefresh}`,
+      },
+      {
+        name: "v1.1-only",
+        cookie: `arena-auth-prod-v1.1=${v11}`,
+      },
+      {
+        name: "v1-only",
+        cookie: `arena-auth-prod-v1=${v1old}`,
+      },
+      {
+        name: "no-auth-cookie",
+        cookie: `provisional_user_id=${session.cookie.match(/provisional_user_id=([^;]+)/)?.[1] ?? ""}`,
+      },
+    ];
+
+    const results = [];
+    for (const variant of variants) {
+      const meRes = await fetch(`${BASE}/api/me`, {
+        headers: {
+          "User-Agent": UA,
+          Accept: "application/json, text/event-stream, */*",
+          Origin: BASE,
+          Referer: BASE + "/agent",
+          Cookie: variant.cookie,
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+      results.push({
+        variant: variant.name,
+        meStatus: meRes.status,
+        meBody: (await meRes.text()).slice(0, 150),
+      });
+    }
+    return {
+      results,
+      v10Length: v10.length,
+      v11Length: v11.length,
+      v10Json,
+      accessPayload,
+      v1Json,
+      hasV1: Boolean(v1old),
+    };
+  },
+});
+
+// Tes: apakah /nextjs-api/sign-up bisa langsung menerima email+password
+// (membuat user arena lengkap dari server, tanpa magic-link).
+export const debugSignupDirect = action({
+  args: {},
+  handler: async (): Promise<Record<string, unknown>> => {
+    const address = randomAddress();
+    const password = "TempPass!" + Math.random().toString(36).slice(2, 10);
+    const token = await mintRecaptchaToken();
+    if (!token) return { error: "token recaptcha gagal" };
+
+    const payloads: Array<Record<string, unknown>> = [
+      {
+        email: address,
+        password,
+        fullName: "Test Arena",
+        shouldLinkHistory: false,
+        marketingConsent: false,
+        registeredCountryCode: "ID",
+      },
+      {
+        email: address,
+        password,
+        shouldLinkHistory: false,
+        registeredCountryCode: "ID",
+      },
+      {
+        email: address,
+        password,
+        fullName: "Test Arena",
+        shouldLinkHistory: false,
+      },
+    ];
+
+    const results = [];
+    for (let i = 0; i < payloads.length; i++) {
+      const res = await fetch(`${BASE}/nextjs-api/sign-up`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": UA,
+          Origin: BASE,
+          Referer: BASE + "/agent",
+        },
+        body: JSON.stringify({ ...payloads[i], recaptchaToken: token }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      const setCookie = res.headers.get("set-cookie") ?? "";
+      results.push({
+        variant: i,
+        status: res.status,
+        setCookieNames: setCookie
+          .split(",")
+          .map((c: string) => c.split(";")[0].split("=")[0]),
+        body: (await res.text()).slice(0, 300),
+      });
+      if (res.status === 200 || res.status === 201) break;
+    }
+    return { address, password, results };
+  },
+});
+
+// Probe skema Zod endpoint sign-up dengan body kosong / variasi field.
+export const debugSignupSchema = action({
+  args: {},
+  handler: async (): Promise<Record<string, unknown>> => {
+    const results = [];
+    const variants: Array<{ name: string; body: Record<string, unknown> }> = [
+      { name: "empty", body: {} },
+      { name: "only-recaptcha", body: { recaptchaToken: "x" } },
+      {
+        name: "only-provisional",
+        body: { provisionalUserId: crypto.randomUUID() },
+      },
+      {
+        name: "both+",
+        body: {
+          recaptchaToken: "x",
+          provisionalUserId: crypto.randomUUID(),
+          email: "tes@example.com",
+          password: "pw",
+          fullName: "T",
+        },
+      },
+      {
+        name: "both+signup_intent",
+        body: {
+          recaptchaToken: "x",
+          provisionalUserId: crypto.randomUUID(),
+          signup_intent_id: "abc",
+        },
+      },
+    ];
+    for (const v of variants) {
+      const res = await fetch(`${BASE}/nextjs-api/sign-up`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": UA,
+          Origin: BASE,
+          Referer: BASE + "/agent",
+        },
+        body: JSON.stringify(v.body),
+        signal: AbortSignal.timeout(20_000),
+      });
+      results.push({
+        variant: v.name,
+        status: res.status,
+        body: (await res.text()).slice(0, 400),
+      });
+    }
+    return { results };
+  },
+});
+
 export const debugCreateChat = action({
   args: { message: v.optional(v.string()) },
   handler: async (

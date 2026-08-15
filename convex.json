@@ -3,5 +3,6 @@
   "functions": "src/convex/",
   "aiFiles": {
     "enabled": false
-  }
+  },
+  "actionTimeoutSeconds": 300
 }
