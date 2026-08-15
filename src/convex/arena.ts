@@ -396,6 +396,135 @@ export const debugChat = action({
   },
 });
 
+// ====== DEBUG: bypass reCAPTCHA via anchor protocol (origin lmarena.ai) ======
+
+const RECAPTCHA_KEY = "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0";
+const RECAPTCHA_ORIGIN = "https://lmarena.ai";
+const RECAPTCHA_ORIGIN_B64 = "aHR0cHM6Ly9sbWFyZW5hLmFp";
+const RECAPTCHA_VERSION = "XOqlk8PL_yVx6IdpLbpXdiLy";
+
+const RECAPTCHA_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+async function mintRecaptchaToken(extra = ""): Promise<string | null> {
+  const url =
+    `https://www.google.com/recaptcha/enterprise/anchor?ar=1` +
+    `&k=${RECAPTCHA_KEY}` +
+    `&co=${RECAPTCHA_ORIGIN_B64}` +
+    `&hl=en&v=${RECAPTCHA_VERSION}&size=invisible&cb=${Math.random().toString(36).slice(2)}${extra}`;
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": RECAPTCHA_UA,
+      Origin: RECAPTCHA_ORIGIN,
+      Referer: RECAPTCHA_ORIGIN + "/",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
+    signal: AbortSignal.timeout(15_000),
+  });
+  const html = await res.text();
+  const m = html.match(/id="recaptcha-token" value="([^"]+)"/);
+  return m?.[1] ?? null;
+}
+
+async function createChatWithCookie(
+  cookie: string,
+  token: string,
+  message: string,
+  origin: string,
+): Promise<{ status: number; body: string }> {
+  const payload = {
+    message: {
+      id: crypto.randomUUID(),
+      role: "user",
+      parts: [{ type: "text", text: message }],
+    },
+    timezone: "Asia/Jakarta",
+    recaptchaV2Token: null,
+    recaptchaV3Token: token,
+  };
+  const headers: Record<string, string> = {
+    "User-Agent": UA,
+    Accept: "application/json, text/event-stream, */*",
+    Cookie: cookie,
+  };
+  if (origin) {
+    headers.Origin = origin;
+    headers.Referer = origin + "/agent";
+  }
+  headers["Content-Type"] = "application/json";
+  const res = await fetch(`${BASE}/nextjs-api/stream/create-chat`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(20_000),
+  });
+  return { status: res.status, body: (await res.text()).slice(0, 300) };
+}
+
+export const debugBypass = action({
+  args: { message: v.optional(v.string()) },
+  handler: async (ctx, { message }): Promise<Record<string, unknown>> => {
+    const session: FirstSession = await ctx.runQuery(
+      internal.arenaSession.firstSession,
+      {},
+    );
+    if (!session) {
+      return { error: "Tidak ada sesi tersimpan di Convex." };
+    }
+
+    const msg = message ?? "halo, ini tes bypass recaptcha — balas singkat";
+    const token = await mintRecaptchaToken();
+    if (!token) {
+      return { error: "Gagal mengambil token dari anchor." };
+    }
+    const origins = [
+      { name: "arena.ai", origin: "https://arena.ai" },
+      { name: "lmarena.ai", origin: "https://lmarena.ai" },
+      { name: "no-origin", origin: "" },
+    ];
+    const results = [];
+    for (const o of origins) {
+      let res: { status: number; body: string };
+      try {
+        res = await createChatWithCookie(session.cookie, token, msg, o.origin);
+      } catch (error) {
+        results.push({
+          variant: o.name,
+          error: `fetch gagal: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        continue;
+      }
+      results.push({
+        variant: o.name,
+        status: res.status,
+        body: res.body,
+      });
+    }
+    return { tokenLength: token.length, results };
+  },
+});
+
+// Tes dengan token yang di-mint di browser sungguhan (dari console arena.ai).
+export const debugToken = action({
+  args: { token: v.string(), message: v.optional(v.string()) },
+  handler: async (ctx, { token, message }): Promise<Record<string, unknown>> => {
+    const session: FirstSession = await ctx.runQuery(
+      internal.arenaSession.firstSession,
+      {},
+    );
+    if (!session) {
+      return { error: "Tidak ada sesi tersimpan di Convex." };
+    }
+    const res = await createChatWithCookie(
+      session.cookie,
+      token.trim(),
+      message ?? "halo, ini tes token browser",
+      "https://arena.ai",
+    );
+    return { status: res.status, body: res.body };
+  },
+});
+
 export const debugCreateChat = action({
   args: { message: v.optional(v.string()) },
   handler: async (
