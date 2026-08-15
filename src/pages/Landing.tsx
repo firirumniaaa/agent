@@ -22,7 +22,7 @@ const STEPS = [
   {
     icon: Cookie,
     title: "Ambil cookie",
-    body: "Login di arena.ai/agent lalu salin document.cookie dari Console DevTools.",
+    body: "Login di arena.ai/agent lalu salin SELURUH document.cookie dari Console DevTools (semua cookie, bukan cuma auth).",
   },
   {
     icon: KeyRound,
@@ -281,8 +281,8 @@ export default function Landing() {
               Siap mencoba?
             </h2>
             <p className="mx-auto mt-3 max-w-md text-sm leading-relaxed text-muted-foreground">
-              Ambil cookie-mu di arena.ai/agent, tempel di halaman masuk, dan
-              kirim pesan pertamamu dalam hitungan detik.
+              Ambil seluruh cookie-mu di arena.ai/agent (document.cookie), tempel
+              di halaman masuk, dan kirim pesan pertamamu dalam hitungan detik.
             </p>
             <Button
               asChild

@@ -42,6 +42,21 @@ function extractUser(body: string) {
   }
 }
 
+/** Cookie auth wajib ada — seperti output bookmarklet "ARENA AUTH COOKIES". */
+const REQUIRED_AUTH_COOKIES = [
+  "arena-auth-prod-v1.0",
+  "arena-auth-prod-v1.1",
+];
+
+/** Cek cookie yang kurang (case-insensitive, toleran spasi/newline). */
+function missingAuthCookies(cookie: string): string[] {
+  return REQUIRED_AUTH_COOKIES.filter((name) => {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`(?:^|;)\\s*${escaped}=`, "i");
+    return !re.test(cookie);
+  });
+}
+
 /** Validasi cookie terhadap /api/me lalu simpan sesi. */
 export const login = action({
   args: { clientId: v.string(), cookie: v.string() },
@@ -49,6 +64,19 @@ export const login = action({
     const trimmed = cookie.trim();
     if (!trimmed) {
       throw new ConvexError("Cookie kosong. Tempel cookie arena.ai dulu.");
+    }
+
+    // Cookie harus LENGKAP — seluruh hasil document.cookie (bukan cuma 2 cookie
+    // auth). Kalau auth cookie kurang, /api/me pasti gagal → tolak lebih awal
+    // dengan pesan yang jelas.
+    const missing = missingAuthCookies(trimmed);
+    if (missing.length > 0) {
+      return {
+        ok: false as const,
+        status: 400,
+        body: `Cookie belum lengkap. Yang kurang: ${missing.join(", ")}. Tempel SELURUH hasil document.cookie dari arena.ai (semua cookie, dipisah titik koma), bukan cuma 2 cookie auth.`,
+        user: null,
+      };
     }
 
     let res: Response;
