@@ -633,6 +633,87 @@ function randomAddress(): string {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Pecah Set-Cookie jadi array pasangan "name=value" yang bersih.
+ * getSetCookie() adalah API yang benar — header Set-Cookie manual di-split
+ * pakai koma akan salah pecah karena Expires memuat koma ("Thu, 15 Aug ...").
+ */
+function collectSetCookies(res: Response): string[] {
+  const headers = res.headers as Headers & {
+    getSetCookie?: () => string[];
+  };
+  if (typeof headers.getSetCookie === "function") {
+    return headers
+      .getSetCookie()
+      .map((c: string) => c.split(";")[0].trim())
+      .filter(Boolean);
+  }
+  // Fallback manual: koma hanya pemisah jika bukan bagian dari Expires=.
+  const header = headers.get("set-cookie") ?? "";
+  const parts: string[] = [];
+  let current = "";
+  let i = 0;
+  while (i < header.length) {
+    const ch = header[i];
+    if (ch === ",") {
+      const tail = current.slice(current.lastIndexOf(";") + 1);
+      if (!/expires=/i.test(tail)) {
+        parts.push(current.trim());
+        current = "";
+        i++;
+        continue;
+      }
+    }
+    current += ch;
+    i++;
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts.map((c) => c.split(";")[0].trim()).filter(Boolean);
+}
+
+const B64_ALPHABET =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/**
+ * Decode base64/base64url ke UTF-8 — murni manual (tanpa Buffer/atob yang
+ * tidak konsisten di runtime Convex). Toleran tanpa padding & karakter aneh.
+ */
+function b64UrlDecode(s: string): string {
+  const cleaned = s.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  const bytes: number[] = [];
+  let buffer = 0;
+  let bits = 0;
+  for (const ch of cleaned) {
+    const val = B64_ALPHABET.indexOf(ch);
+    if (val === -1) continue;
+    buffer = (buffer << 6) | val;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((buffer >> bits) & 0xff);
+    }
+  }
+  return new TextDecoder().decode(Uint8Array.from(bytes));
+}
+
+/** Encode UTF-8 ke base64url (tanpa padding) — murni manual, tanpa btoa. */
+function b64UrlEncode(s: string): string {
+  const bytes = new TextEncoder().encode(s);
+  let result = "";
+  let buffer = 0;
+  let bits = 0;
+  for (const b of bytes) {
+    buffer = (buffer << 8) | b;
+    bits += 8;
+    while (bits >= 6) {
+      bits -= 6;
+      result += B64_ALPHABET[(buffer >> bits) & 0x3f];
+    }
+  }
+  if (bits > 0) result += B64_ALPHABET[(buffer << (6 - bits)) & 0x3f];
+  return result;
+}
+
 export const debugTempSignup = action({
   args: {},
   handler: async (): Promise<Record<string, unknown>> => {
@@ -758,9 +839,8 @@ export const debugVerifyAndChat = action({
         },
         signal: AbortSignal.timeout(15_000),
       });
-      const setCookie = res.headers.get("set-cookie");
       const location = res.headers.get("location");
-      const cookiePairs = (setCookie ?? "").split(",").map((c) => c.split(";")[0]);
+      const cookiePairs = collectSetCookies(res);
       for (const pair of cookiePairs) {
         if (pair && !cookies.includes(pair)) cookies.push(pair);
       }
@@ -768,7 +848,7 @@ export const debugVerifyAndChat = action({
         hop: i,
         status: res.status,
         location: location?.slice(0, 120) ?? null,
-        setCookieCount: cookiePairs.filter(Boolean).length,
+        setCookieCount: cookiePairs.length,
         bodyPreview: (await res.text()).slice(0, 120),
       });
       if (location) {
@@ -813,19 +893,15 @@ export const debugVerifyAndChat = action({
         signal: AbortSignal.timeout(20_000),
       });
       const spBody = await spRes.text();
-      if (spRes.ok) {
-        const spCookie = spRes.headers.get("set-cookie") ?? "";
-        const spPairs = spCookie
-          .split(",")
-          .map((c: string) => c.split(";")[0])
-          .filter((c: string) => c && !cookies.includes(c));
-        for (const p of spPairs) cookies.push(p);
-        sessionCookie = cookies.join("; ");
-      }
+      const spPairs = collectSetCookies(spRes).filter(
+        (c: string) => c && !cookies.includes(c),
+      );
+      for (const p of spPairs) cookies.push(p);
+      sessionCookie = cookies.join("; ");
       accountResults.push({
         step: "set-password",
         status: spRes.status,
-        setCookieCount: spRes.headers.get("set-cookie")?.split(",").length ?? 0,
+        setCookieCount: spPairs.length,
         body: spBody.slice(0, 300),
       });
     }
@@ -848,11 +924,9 @@ export const debugVerifyAndChat = action({
           body: JSON.stringify({ recaptchaToken, provisionalUserId }),
           signal: AbortSignal.timeout(20_000),
         });
-        const setCookie = res.headers.get("set-cookie") ?? "";
-        const newPairs = setCookie
-          .split(",")
-          .map((c: string) => c.split(";")[0])
-          .filter((c: string) => c && !cookies.includes(c));
+        const newPairs = collectSetCookies(res).filter(
+          (c: string) => c && !cookies.includes(c),
+        );
         for (const p of newPairs) cookies.push(p);
         sessionCookie = cookies.join("; ");
         accountResults.push({
@@ -926,20 +1000,15 @@ export const debugTempSessionTest = action({
     const v10 = session.cookie.match(/arena-auth-prod-v1\.0=([^;]+)/)?.[1] ?? "";
     const v11 = session.cookie.match(/arena-auth-prod-v1\.1=([^;]+)/)?.[1] ?? "";
 
-    // Decode payload v1.0 (base64-<json dengan access_token>)
+    // Decode payload v1.0 + v1.1 (arena membagi SATU nilai besar jadi dua
+    // cookie: v1.0 = bagian pertama, v1.1 = lanjutannya).
     let innerAccess = "";
     let innerRefresh = "";
     let v10Json = null;
     try {
       if (v10.startsWith("base64-")) {
-        const b64 = v10
-          .slice(7)
-          .replace(/-/g, "+")
-          .replace(/_/g, "/")
-          .padEnd(Math.ceil(v10.length / 4) * 4, "=");
-        v10Json = JSON.parse(
-          Buffer.from(b64, "base64").toString("utf-8"),
-        ) as Record<string, unknown>;
+        const combined = v10.slice(7) + v11;
+        v10Json = JSON.parse(b64UrlDecode(combined)) as Record<string, unknown>;
         innerAccess = (v10Json.access_token as string) ?? "";
         innerRefresh = (v10Json.refresh_token as string) ?? "";
       }
@@ -952,12 +1021,8 @@ export const debugTempSessionTest = action({
     try {
       const parts = innerAccess.split(".");
       if (parts.length === 3) {
-        const b64 = parts[1]
-          .replace(/-/g, "+")
-          .replace(/_/g, "/")
-          .padEnd(Math.ceil(parts[1].length / 4) * 4, "=");
         accessPayload = JSON.parse(
-          Buffer.from(b64, "base64").toString("utf-8"),
+          b64UrlDecode(parts[1]),
         ) as Record<string, unknown>;
       }
     } catch {
@@ -969,14 +1034,7 @@ export const debugTempSessionTest = action({
     let v1Json: Record<string, unknown> | null = null;
     try {
       if (v1old.startsWith("base64-")) {
-        const b64 = v1old
-          .slice(7)
-          .replace(/-/g, "+")
-          .replace(/_/g, "/")
-          .padEnd(Math.ceil(v1old.length / 4) * 4, "=");
-        v1Json = JSON.parse(
-          Buffer.from(b64, "base64").toString("utf-8"),
-        ) as Record<string, unknown>;
+        v1Json = JSON.parse(b64UrlDecode(v1old.slice(7))) as Record<string, unknown>;
       }
     } catch {
       // ignore
@@ -1032,6 +1090,8 @@ export const debugTempSessionTest = action({
       results,
       v10Length: v10.length,
       v11Length: v11.length,
+      v10RawPrefix: v10.slice(0, 120),
+      v11RawPrefix: v11.slice(0, 120),
       v10Json,
       accessPayload,
       v1Json,
@@ -1086,13 +1146,12 @@ export const debugSignupDirect = action({
         body: JSON.stringify({ ...payloads[i], recaptchaToken: token }),
         signal: AbortSignal.timeout(20_000),
       });
-      const setCookie = res.headers.get("set-cookie") ?? "";
       results.push({
         variant: i,
         status: res.status,
-        setCookieNames: setCookie
-          .split(",")
-          .map((c: string) => c.split(";")[0].split("=")[0]),
+        setCookieNames: collectSetCookies(res).map(
+          (c: string) => c.split(";")[0].split("=")[0],
+        ),
         body: (await res.text()).slice(0, 300),
       });
       if (res.status === 200 || res.status === 201) break;
@@ -1148,6 +1207,603 @@ export const debugSignupSchema = action({
         variant: v.name,
         status: res.status,
         body: (await res.text()).slice(0, 400),
+      });
+    }
+    return { results };
+  },
+});
+
+/**
+ * Gabungkan cookie lama + pasangan baru (name=value terakhir menang).
+ */
+function mergeCookies(existing: string, newPairs: string[]): string {
+  const map = new Map<string, string>();
+  for (const pair of existing.split(";")) {
+    const eq = pair.indexOf("=");
+    if (eq > 0) map.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+  }
+  for (const pair of newPairs) {
+    const eq = pair.indexOf("=");
+    if (eq > 0) map.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+  }
+  return Array.from(map.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join("; ");
+}
+
+/**
+ * Coba beberapa varian POST /nextjs-api/sign-up untuk mengaktifkan user arena
+ * (row user yang dicari /api/me). Begitu /api/me 200, langsung tes create-chat
+ * dengan sesi baru.
+ */
+export const debugFinishSignup = action({
+  args: {},
+  handler: async (ctx): Promise<Record<string, unknown>> => {
+    const session: FirstSession = await ctx.runQuery(
+      internal.arenaSession.firstSession,
+      {},
+    );
+    if (!session) {
+      return { error: "Tidak ada sesi tersimpan. Jalankan debugVerifyAndChat dulu." };
+    }
+
+    const cookie = session.cookie;
+    const provisionalUserId =
+      cookie.match(/provisional_user_id=([^;]+)/)?.[1] ?? "";
+    const v10 = cookie.match(/arena-auth-prod-v1\.0=([^;]+)/)?.[1] ?? "";
+    const v11 = cookie.match(/arena-auth-prod-v1\.1=([^;]+)/)?.[1] ?? "";
+
+    let email = "";
+    let signupIntentId = "";
+    try {
+      const json = JSON.parse(b64UrlDecode(v10.slice(7) + v11)) as {
+        user?: {
+          email?: string;
+          user_metadata?: { signup_intent_id?: string };
+        };
+      };
+      email = json.user?.email ?? "";
+      signupIntentId = json.user?.user_metadata?.signup_intent_id ?? "";
+    } catch (error) {
+      return { error: `decode sesi gagal: ${String(error)}` };
+    }
+
+    const token = await mintRecaptchaToken();
+    if (!token) return { error: "token recaptcha gagal" };
+
+    const variants: Array<{ name: string; body: Record<string, unknown> }> = [
+      {
+        name: "intent-only",
+        body: { recaptchaToken: token, signup_intent_id: signupIntentId },
+      },
+      {
+        name: "intent+provisional",
+        body: {
+          recaptchaToken: token,
+          signup_intent_id: signupIntentId,
+          provisionalUserId,
+        },
+      },
+      {
+        name: "email+intent",
+        body: { recaptchaToken: token, email, signup_intent_id: signupIntentId },
+      },
+      {
+        name: "email+provisional",
+        body: { recaptchaToken: token, email, provisionalUserId },
+      },
+    ];
+
+    const results: Array<Record<string, unknown>> = [];
+    let finalCookie = cookie;
+    let success = false;
+    for (const v of variants) {
+      if (success) break;
+      let res: Response;
+      try {
+        res = await fetch(`${BASE}/nextjs-api/sign-up`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": UA,
+            Origin: BASE,
+            Referer: BASE + "/agent",
+            Cookie: finalCookie,
+          },
+          body: JSON.stringify(v.body),
+          signal: AbortSignal.timeout(20_000),
+        });
+      } catch (error) {
+        results.push({ variant: v.name, error: String(error) });
+        continue;
+      }
+      const bodyText = (await res.text()).slice(0, 300);
+      const newPairs = collectSetCookies(res);
+      results.push({
+        variant: v.name,
+        status: res.status,
+        setCookieCount: newPairs.length,
+        body: bodyText,
+      });
+      if (!res.ok) continue;
+
+      finalCookie = mergeCookies(finalCookie, newPairs);
+      const meRes = await fetch(`${BASE}/api/me`, {
+        headers: {
+          "User-Agent": UA,
+          Accept: "application/json, text/event-stream, */*",
+          Origin: BASE,
+          Referer: BASE + "/agent",
+          Cookie: finalCookie,
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+      const meBody = (await meRes.text()).slice(0, 300);
+      results.push({
+        variant: v.name + "->me",
+        status: meRes.status,
+        body: meBody,
+      });
+      if (meRes.status !== 200) continue;
+
+      // /api/me OK → tes create-chat dengan token recaptcha BARU
+      success = true;
+      const token2 = await mintRecaptchaToken();
+      let chatResult: Record<string, unknown> = { skipped: "token2 gagal" };
+      if (token2) {
+        const chat = await createChatWithCookie(
+          finalCookie,
+          token2,
+          "halo, tes sesi lengkap dari email sementara — balas singkat",
+          "https://arena.ai",
+        );
+        chatResult = { status: chat.status, body: chat.body };
+      }
+
+      await ctx.runMutation(internal.arenaSession.upsert, {
+        clientId: "temp-mail-session",
+        cookie: finalCookie,
+        name: "Temp Mail",
+        email,
+      });
+      return { email, signupIntentId, provisionalUserId, results, chatResult };
+    }
+
+    return { email, signupIntentId, provisionalUserId, results };
+  },
+});
+
+/**
+ * Alur TERBALIK: sign-up (provisionalUserId) DULU, baru set-password.
+ * Hipotesis: set-password membuat Supabase user; /api/me butuh row arena user
+ * yang dibuat oleh /nextjs-api/sign-up — dan sign-up harus dipanggil SEBELUM
+ * user email ada, kalau tidak dapat "User already exists".
+ */
+export const debugSignupReverse = action({
+  args: {
+    doSetPassword: v.optional(v.boolean()),
+    message: v.optional(v.string()),
+  },
+  handler: async (
+    ctx,
+    { doSetPassword, message },
+  ): Promise<Record<string, unknown>> => {
+    // 1) Mailbox sementara baru
+    const address = randomAddress();
+    const password = "TempPass!" + Math.random().toString(36).slice(2, 10);
+    try {
+      const createRes = await fetch(`${MAIL_TM}/accounts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address, password }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (createRes.status !== 201) {
+        return {
+          error: `mail.tm create: HTTP ${createRes.status} ${(await createRes.text()).slice(0, 200)}`,
+        };
+      }
+    } catch (error) {
+      return { error: `mail.tm create gagal: ${String(error)}` };
+    }
+
+    // 2) Magic link
+    const magicRes = await fetch(`${BASE}/nextjs-api/sign-up/magic-link`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+        Origin: BASE,
+        Referer: BASE + "/agent",
+      },
+      body: JSON.stringify({
+        email: address,
+        fullName: "Test Arena",
+        shouldLinkHistory: false,
+        marketingConsent: false,
+        registeredCountryCode: "ID",
+      }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    const magicStatus = magicRes.status;
+    const magicBody = (await magicRes.text()).slice(0, 200);
+    if (magicStatus !== 200) {
+      return { address, magicStatus, magicBody };
+    }
+
+    // 3) Token mail.tm + poll inbox sampai email tiba
+    let token = "";
+    try {
+      const tRes = await fetch(`${MAIL_TM}/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address, password }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      token = ((await tRes.json()) as { token?: string }).token ?? "";
+    } catch {
+      // token kosong — poll tetap jalan tanpa auth
+    }
+
+    let callbackUrl = "";
+    for (let i = 0; i < 5 && !callbackUrl; i++) {
+      await sleep(5000);
+      try {
+        const mRes = await fetch(`${MAIL_TM}/messages`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(15_000),
+        });
+        const members =
+          ((await mRes.json()) as { "hydra:member"?: Array<{ id: string }> })[
+            "hydra:member"
+          ] ?? [];
+        if (members.length > 0) {
+          const dRes = await fetch(`${MAIL_TM}/messages/${members[0].id}`, {
+            headers: { Authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(15_000),
+          });
+          const detail = (await dRes.json()) as { text?: string };
+          const match = (detail.text ?? "").match(
+            /https:\/\/arena\.ai\/nextjs-api\/callback\/[^\s]+/,
+          );
+          if (match) callbackUrl = match[0];
+        }
+      } catch {
+        // retry
+      }
+    }
+    if (!callbackUrl) {
+      return { address, error: "Callback tidak ditemukan di email." };
+    }
+
+    // 4) Follow redirect (tanpa set-password), kumpulkan cookie provisional
+    const cookies: string[] = [];
+    let current = callbackUrl;
+    let setPasswordFullLocation = "";
+    for (let i = 0; i < 6; i++) {
+      const res = await fetch(current, {
+        redirect: "manual",
+        headers: {
+          "User-Agent": UA,
+          Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+      const location = res.headers.get("location");
+      const pairs = collectSetCookies(res);
+      for (const p of pairs) if (p && !cookies.includes(p)) cookies.push(p);
+      if (location) {
+        if (location.includes("/auth/set-password")) {
+          setPasswordFullLocation = new URL(location, current).toString();
+        }
+        current = new URL(location, current).toString();
+      } else {
+        break;
+      }
+    }
+    const cookieBase = cookies.join("; ");
+    const provisionalUserId =
+      cookieBase.match(/provisional_user_id=([^;]+)/)?.[1] ?? "";
+    const setPasswordToken =
+      setPasswordFullLocation.match(/token=([^&]+)/)?.[1] ?? "";
+
+    // 5) sign-up DULU (belum ada user email → seharusnya sukses)
+    const recaptchaToken = await mintRecaptchaToken();
+    if (!recaptchaToken) {
+      return { address, error: "recaptcha token gagal" };
+    }
+    // Varian 1: sign-up dengan email (row arena langsung terisi email)
+    let suRes = await fetch(`${BASE}/nextjs-api/sign-up`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+        Origin: BASE,
+        Referer: BASE + "/agent",
+        Cookie: cookieBase,
+      },
+      body: JSON.stringify({
+        recaptchaToken,
+        provisionalUserId,
+        email: address,
+      }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    let suBodyFull = await suRes.text();
+    let suStatus = suRes.status;
+    let suBodyText = suBodyFull.slice(0, 300);
+    if (suStatus === 400 && suBodyText.includes("Invalid request body")) {
+      // Varian 2: tanpa email (skema lama)
+      suRes = await fetch(`${BASE}/nextjs-api/sign-up`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": UA,
+          Origin: BASE,
+          Referer: BASE + "/agent",
+          Cookie: cookieBase,
+        },
+        body: JSON.stringify({ recaptchaToken, provisionalUserId }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      suBodyFull = await suRes.text();
+      suBodyText = suBodyFull.slice(0, 300);
+      suStatus = suRes.status;
+    }
+    const suBody = suBodyText;
+    const suPairs = collectSetCookies(suRes);
+    let cookieAfter = mergeCookies(cookieBase, suPairs);
+
+    // 5b) Poll inbox untuk email VERIFIKASI Supabase (type=signup). Link ini
+    //     yang bikin user aktif penuh — tanpa klik, userState belum "active".
+    let verificationUrl = "";
+    let verificationStatus = "tidak-ditemukan";
+    for (let i = 0; i < 4 && !verificationUrl; i++) {
+      await sleep(6000);
+      try {
+        const mRes = await fetch(`${MAIL_TM}/messages`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(15_000),
+        });
+        const members =
+          ((await mRes.json()) as {
+            "hydra:member"?: Array<{ id: string; subject?: string }>;
+          })["hydra:member"] ?? [];
+        for (const m of members) {
+          const dRes = await fetch(`${MAIL_TM}/messages/${m.id}`, {
+            headers: { Authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(15_000),
+          });
+          const detail = (await dRes.json()) as { text?: string };
+          const match = (detail.text ?? "").match(
+            /https:\/\/[a-z0-9-]+\.supabase\.co\/auth\/v1\/verify[^\s"<]+/i,
+          );
+          if (match) {
+            verificationUrl = match[0];
+            break;
+          }
+        }
+      } catch {
+        // retry
+      }
+    }
+    if (verificationUrl) {
+      let vCurrent = verificationUrl;
+      for (let i = 0; i < 5; i++) {
+        const vRes = await fetch(vCurrent, {
+          redirect: "manual",
+          headers: {
+            "User-Agent": UA,
+            Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+            Cookie: cookieAfter,
+          },
+          signal: AbortSignal.timeout(15_000),
+        });
+        const vLoc = vRes.headers.get("location");
+        const vPairs = collectSetCookies(vRes);
+        if (vPairs.length > 0) {
+          cookieAfter = mergeCookies(cookieAfter, vPairs);
+          verificationStatus = `ok(status=${vRes.status}, cookies=${vPairs.length})`;
+        }
+        if (vLoc) {
+          vCurrent = new URL(vLoc, vCurrent).toString();
+        } else {
+          break;
+        }
+      }
+    }
+
+    const meCall = async (cookie: string) => {
+      const r = await fetch(`${BASE}/api/me`, {
+        headers: {
+          "User-Agent": UA,
+          Accept: "application/json, text/event-stream, */*",
+          Origin: BASE,
+          Referer: BASE + "/agent",
+          Cookie: cookie,
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+      return { status: r.status, body: (await r.text()).slice(0, 200) };
+    };
+
+    // 6a) Tes /api/me dengan sesi hasil sign-up SAJA
+    const meAfterSignup = await meCall(cookieAfter);
+    const cookieAfterSignup = cookieAfter;
+
+    // 6a2) Konstruksi cookie v1.0/v1.1 dari session JSON respons sign-up.
+    //      Server membagi nilai jadi dua cookie (v1.0 = 3180 char termasuk
+    //      prefix "base64-", v1.1 = sisanya) — inilah yang create-chat butuh.
+    let cookieV10v11 = cookieAfterSignup;
+    let constructed: Record<string, unknown> = { skipped: "signup != 200" };
+    if (suStatus === 200) {
+      try {
+        const session = JSON.parse(suBodyFull) as Record<string, unknown>;
+        const encoded = "base64-" + b64UrlEncode(JSON.stringify(session));
+        const cut = 3180;
+        const part1 = encoded.slice(0, cut);
+        const part2 = encoded.slice(cut);
+        cookieV10v11 = mergeCookies(cookieAfterSignup, [
+          `arena-auth-prod-v1.0=${part1}`,
+          `arena-auth-prod-v1.1=${part2}`,
+        ]);
+        constructed = {
+          sessionKeys: Object.keys(session),
+          encodedLen: encoded.length,
+          part1Len: part1.length,
+          part2Len: part2.length,
+        };
+      } catch (error) {
+        constructed = { error: String(error) };
+      }
+    }
+
+    // 6b) set-password HANYA jika diminta — terbukti membuat user Supabase
+    //     baru yang mengubah sesi v1.0/v1.1 menjadi invalid di /api/me.
+    const generatedPassword =
+      Math.random().toString(36).slice(2, 10) + "ArenaTemp!";
+    let spStatus = 0;
+    let spBody = "";
+    let spPairs: string[] = [];
+    if (doSetPassword && setPasswordToken) {
+      const spRes = await fetch(`${BASE}/nextjs-api/auth/set-password`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": UA,
+          Origin: BASE,
+          Referer: BASE + "/agent",
+          Cookie: cookieAfter,
+        },
+        body: JSON.stringify({
+          password: generatedPassword,
+          token: setPasswordToken,
+        }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      spStatus = spRes.status;
+      spBody = (await spRes.text()).slice(0, 300);
+      spPairs = collectSetCookies(spRes);
+      cookieAfter = mergeCookies(cookieAfter, spPairs);
+    }
+
+    // 7) /api/me final (dengan cookie v1.0/v1.1)
+    const meFinal = await meCall(cookieAfter);
+
+    // 8) Tes /api/me + create-chat dengan:
+    //    - cookieV1  : sesi hasil sign-up (v1 saja)
+    //    - cookieV10 : v1.0/v1.1 hasil konstruksi dari session JSON
+    const meV1 = await meCall(cookieAfterSignup);
+    const meV10 = await meCall(cookieV10v11);
+
+    const token2 = await mintRecaptchaToken();
+    let chatV1: Record<string, unknown> = { skipped: "token2 gagal" };
+    let chatV10: Record<string, unknown> = { skipped: "token2 gagal" };
+    if (token2) {
+      chatV1 = await createChatWithCookie(
+        cookieAfterSignup,
+        token2,
+        message ?? "halo, tes chat sesi baru — balas singkat",
+        "https://arena.ai",
+      );
+      const token3 = await mintRecaptchaToken();
+      if (token3) {
+        chatV10 = await createChatWithCookie(
+          cookieV10v11,
+          token3,
+          message ?? "halo, tes chat sesi baru — balas singkat",
+          "https://arena.ai",
+        );
+      }
+    }
+
+    // Simpan sesi konstruksi (kalau /api/me-nya 200) untuk tes lanjutan
+    await ctx.runMutation(internal.arenaSession.upsert, {
+      clientId: "temp-mail-session",
+      cookie: meV10.status === 200 ? cookieV10v11 : cookieAfterSignup,
+      name: "Temp Mail",
+      email: address,
+    });
+
+    return {
+      address,
+      provisionalUserId,
+      hasSetPasswordToken: Boolean(setPasswordToken),
+      signup: { status: suStatus, body: suBody, setCookieCount: suPairs.length },
+      verificationUrl: verificationUrl.slice(0, 120) || null,
+      verificationStatus,
+      meAfterSignup,
+      setPassword: { status: spStatus, body: spBody, setCookieCount: spPairs.length },
+      meFinal,
+      meV1,
+      meV10,
+      constructed,
+      chatV1,
+      chatV10,
+      cookieNamesAfter: cookieAfter
+        .split(";")
+        .map((c) => c.split("=")[0].trim()),
+    };
+  },
+});
+
+/**
+ * Bandingkan semua sesi tersimpan: decode isi cookie v1.0+v1.1 (Supabase
+ * session) + tes /api/me — untuk melihat beda sesi browser valid vs temp.
+ */
+export const debugCompareSessions = action({
+  args: {},
+  handler: async (ctx): Promise<Record<string, unknown>> => {
+    const sessions = await ctx.runQuery(internal.arenaSession.allSessions, {});
+    const results = [];
+    for (const s of sessions) {
+      const v10 = s.cookie.match(/arena-auth-prod-v1\.0=([^;]+)/)?.[1] ?? "";
+      const v11 = s.cookie.match(/arena-auth-prod-v1\.1=([^;]+)/)?.[1] ?? "";
+      let decoded: Record<string, unknown> | null = null;
+      try {
+        if (v10.startsWith("base64-")) {
+          decoded = JSON.parse(
+            b64UrlDecode(v10.slice(7) + v11),
+          ) as Record<string, unknown>;
+        } else {
+          decoded = { notBase64Prefix: v10.slice(0, 60) };
+        }
+      } catch (error) {
+        decoded = { decodeError: String(error) };
+      }
+      const user = (decoded?.user ?? null) as
+        | {
+            email?: string;
+            id?: string;
+            confirmed_at?: string;
+            is_anonymous?: boolean;
+          }
+        | null;
+      const meRes = await fetch(`${BASE}/api/me`, {
+        headers: {
+          "User-Agent": UA,
+          Accept: "application/json, text/event-stream, */*",
+          Origin: BASE,
+          Referer: BASE + "/agent",
+          Cookie: s.cookie,
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+      results.push({
+        clientId: s.clientId,
+        email: s.email,
+        meStatus: meRes.status,
+        meBody: (await meRes.text()).slice(0, 150),
+        decodedUser: user
+          ? {
+              id: user.id ?? null,
+              email: user.email ?? null,
+              confirmed_at: user.confirmed_at ?? null,
+              is_anonymous: user.is_anonymous ?? null,
+            }
+          : decoded,
+        v10Len: v10.length,
+        v11Len: v11.length,
       });
     }
     return { results };

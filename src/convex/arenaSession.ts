@@ -41,6 +41,21 @@ export const upsert = internalMutation({
   },
 });
 
+/** Semua sesi tersimpan (untuk debug via CLI — internal saja). */
+export const allSessions = internalQuery({
+  args: {},
+  handler: async (ctx) => {
+    const sessions = await ctx.db.query("arenaSessions").order("desc").take(20);
+    return sessions.map((s) => ({
+      clientId: s.clientId,
+      cookie: s.cookie,
+      email: s.email ?? null,
+      name: s.name ?? null,
+      updatedAt: s.updatedAt,
+    }));
+  },
+});
+
 /** Sesi paling baru (untuk debug via CLI — internal saja). */
 export const firstSession = internalQuery({
   args: {},
