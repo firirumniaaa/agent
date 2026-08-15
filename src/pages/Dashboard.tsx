@@ -1,5 +1,6 @@
 import { api } from "@/convex/_generated/api";
 import { useArenaSession } from "@/hooks/use-arena-session";
+import { useAuth } from "@/hooks/use-auth";
 import {
   ARENA_RECAPTCHA_BOOKMARKLET,
   getArenaRecaptchaToken,
@@ -10,14 +11,16 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { useMutation } from "convex/react";
 import {
+  ArrowRight,
   Bot,
   ExternalLink,
   LogOut,
+  Plug,
   Send,
   TerminalSquare,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { Link, Navigate, useNavigate } from "react-router";
+import { Link, useNavigate } from "react-router";
 
 const CONVEX_SITE_URL = (import.meta.env.VITE_CONVEX_URL as string).replace(
   /\.cloud$/,
@@ -49,6 +52,7 @@ function userInitials(name: string | null, email: string | null) {
 
 export default function Dashboard() {
   const { clientId, session, isLoading } = useArenaSession();
+  const { user, isAuthenticated, signOut } = useAuth();
   const logout = useMutation(api.arenaSession.logout);
   const navigate = useNavigate();
 
@@ -69,8 +73,78 @@ export default function Dashboard() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  const handleSignOut = async () => {
+    try {
+      await logout({ clientId });
+    } catch {
+      // abaikan — sesi arena mungkin belum tersambung
+    }
+    if (isAuthenticated) {
+      await signOut();
+    }
+    navigate("/");
+  };
+
   if (!isLoading && !session) {
-    return <Navigate to="/auth" replace />;
+    const appName = user?.name || user?.email || "Pengguna";
+    return (
+      <div className="dark flex h-dvh flex-col bg-background text-foreground antialiased">
+        <header className="border-b border-white/10 bg-card/40 backdrop-blur">
+          <div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-3 px-4 py-3">
+            <Link to="/" className="flex items-center gap-2">
+              <div className="flex size-8 items-center justify-center rounded-lg border border-emerald-500/30 bg-emerald-500/10 text-emerald-400">
+                <TerminalSquare className="size-4" />
+              </div>
+              <div className="leading-tight">
+                <p className="font-mono text-sm font-semibold tracking-tight">
+                  arena://agent
+                </p>
+                <p className="text-[11px] text-muted-foreground">
+                  Agent Mode — web client
+                </p>
+              </div>
+            </Link>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              className="text-muted-foreground hover:text-foreground"
+              onClick={handleSignOut}
+              title="Keluar"
+            >
+              <LogOut className="size-4" />
+            </Button>
+          </div>
+        </header>
+        <main className="flex flex-1 items-center justify-center px-4">
+          <div className="w-full max-w-md rounded-2xl border border-white/10 bg-card/50 p-8 text-center shadow-2xl shadow-black/40">
+            <div className="mx-auto mb-4 flex size-12 items-center justify-center rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-400">
+              <Plug className="size-6" />
+            </div>
+            <h2 className="text-lg font-bold tracking-tight">
+              Akun siap — tinggal hubungkan cookie arena.ai
+            </h2>
+            <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+              Login web berhasil ({appName}). Untuk mengirim pesan ke Agent
+              Mode, hubungkan dulu sesi arena.ai-mu lewat halaman masuk.
+            </p>
+            <Button
+              asChild
+              className="mt-6 w-full bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+            >
+              <Link to="/auth?tab=arena">
+                Hubungkan cookie arena
+                <ArrowRight className="size-4" />
+              </Link>
+            </Button>
+            <p className="mt-3 text-[11px] text-muted-foreground/70">
+              Tempel seluruh <code className="font-mono">document.cookie</code>{" "}
+              dari arena.ai — sesi divalidasi dulu sebelum disimpan.
+            </p>
+          </div>
+        </main>
+      </div>
+    );
   }
 
   const handleSend = async (raw?: string) => {
@@ -176,11 +250,6 @@ export default function Dashboard() {
       setIsStreaming(false);
       inputRef.current?.focus();
     }
-  };
-
-  const handleSignOut = async () => {
-    await logout({ clientId });
-    navigate("/");
   };
 
   const copyRecaptchaBookmarklet = async () => {

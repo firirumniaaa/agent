@@ -20,14 +20,14 @@ const fadeUp = {
 
 const STEPS = [
   {
-    icon: Cookie,
-    title: "Ambil cookie",
-    body: "Login di arena.ai/agent lalu salin SELURUH document.cookie dari Console DevTools (semua cookie, bukan cuma auth).",
+    icon: KeyRound,
+    title: "Login / Daftar",
+    body: "Masuk pakai password atau kode email (akun otomatis dibuat saat kode diverifikasi), atau langsung pakai cookie arena.ai.",
   },
   {
-    icon: KeyRound,
-    title: "Tempel & verifikasi",
-    body: "Tempel cookie di halaman masuk — sesi divalidasi ke /api/me sebelum disimpan.",
+    icon: Cookie,
+    title: "Hubungkan sesi arena",
+    body: "Tempel SELURUH document.cookie dari arena.ai/agent — sesi divalidasi ke /api/me sebelum disimpan.",
   },
   {
     icon: TerminalSquare,
@@ -171,8 +171,9 @@ export default function Landing() {
             transition={{ duration: 0.55, ease: "easeOut", delay: 0.12 }}
             className="mt-5 max-w-xl text-base leading-relaxed text-muted-foreground sm:text-lg"
           >
-            Login cukup dengan cookie arena.ai — lalu kirim pesan ke Agent Mode
-            dan chat dibuat otomatis tanpa GitHub, persis seperti menjalankan{" "}
+            Login pakai password, kode email, atau cookie arena.ai — lalu
+            kirim pesan ke Agent Mode dan chat dibuat otomatis tanpa GitHub,
+            persis seperti menjalankan{" "}
             <code className="rounded bg-black/40 px-1.5 py-0.5 font-mono text-[13px] text-emerald-300">
               arena_agent_test.py
             </code>
@@ -190,7 +191,7 @@ export default function Landing() {
               className="h-11 bg-emerald-500 px-6 text-zinc-950 hover:bg-emerald-400"
             >
               <Link to="/auth">
-                Masuk dengan Cookie
+                Login / Daftar
                 <ArrowRight className="size-4" />
               </Link>
             </Button>
@@ -281,8 +282,9 @@ export default function Landing() {
               Siap mencoba?
             </h2>
             <p className="mx-auto mt-3 max-w-md text-sm leading-relaxed text-muted-foreground">
-              Ambil seluruh cookie-mu di arena.ai/agent (document.cookie), tempel
-              di halaman masuk, dan kirim pesan pertamamu dalam hitungan detik.
+              Buat akun dengan email + password atau kode email, lalu hubungkan
+              cookie arena.ai-mu — dan kirim pesan pertamamu dalam hitungan
+              detik.
             </p>
             <Button
               asChild
@@ -290,7 +292,7 @@ export default function Landing() {
               className="mt-7 h-11 bg-emerald-500 px-6 text-zinc-950 hover:bg-emerald-400"
             >
               <Link to="/auth">
-                Login & Mulai Chat
+                Masuk ke Dashboard
                 <ArrowRight className="size-4" />
               </Link>
             </Button>
