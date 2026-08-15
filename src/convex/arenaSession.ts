@@ -41,6 +41,25 @@ export const upsert = internalMutation({
   },
 });
 
+/** Sesi paling baru (untuk debug via CLI — internal saja). */
+export const firstSession = internalQuery({
+  args: {},
+  handler: async (ctx) => {
+    const session = await ctx.db
+      .query("arenaSessions")
+      .order("desc")
+      .first();
+    if (!session) return null;
+    return {
+      clientId: session.clientId,
+      cookie: session.cookie,
+      name: session.name ?? null,
+      email: session.email ?? null,
+      updatedAt: session.updatedAt,
+    };
+  },
+});
+
 /** Info sesi aktif untuk browser (tanpa cookie). */
 export const me = query({
   args: { clientId: v.string() },
@@ -62,6 +81,10 @@ export const me = query({
       ),
       repoOwner: process.env.ARENA_REPO_OWNER ?? "",
       repoName: process.env.ARENA_REPO_NAME ?? "",
+      repoId: (() => {
+        const id = Number(process.env.ARENA_REPO_ID ?? "");
+        return Number.isFinite(id) && id > 0 ? id : null;
+      })(),
     };
   },
 });

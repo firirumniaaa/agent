@@ -2,11 +2,21 @@ import { api } from "@/convex/_generated/api";
 import { useArenaSession } from "@/hooks/use-arena-session";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useMutation } from "convex/react";
 import {
   Bot,
   GitBranch,
+  Loader2,
   LogOut,
   Send,
   TerminalSquare,
@@ -29,6 +39,74 @@ interface Message {
   status?: MessageStatus;
 }
 
+interface RepoConfig {
+  repoOwner: string;
+  repoName: string;
+  repoId: number;
+}
+
+const REPO_KEY = "arena:repo";
+
+function loadRepoConfig(): RepoConfig | null {
+  try {
+    const raw = window.localStorage.getItem(REPO_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as RepoConfig;
+    if (
+      parsed.repoOwner &&
+      parsed.repoName &&
+      typeof parsed.repoId === "number" &&
+      parsed.repoId > 0
+    ) {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function saveRepoConfig(config: RepoConfig) {
+  window.localStorage.setItem(REPO_KEY, JSON.stringify(config));
+}
+
+/** Ubah body error arena.ai (JSON polos / ZodError) jadi pesan yang jelas. */
+function formatArenaError(status: number, body: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return body.slice(0, 600);
+  }
+  if (parsed && typeof parsed === "object") {
+    const obj = parsed as { error?: unknown; success?: boolean };
+    const err = obj.error;
+    if (typeof err === "string") {
+      if (err === "coding_agent_disabled") {
+        return (
+          "Arena menolak: fitur coding agent dinonaktifkan di akun arena.ai kamu. " +
+          "Aktifkan Agent Mode dan sambungkan GitHub di arena.ai, lalu coba lagi."
+        );
+      }
+      return err;
+    }
+    if (obj.success === false && err && typeof err === "object") {
+      const issues = (err as {
+        issues?: { path?: Array<string | number>; message?: string }[];
+      }).issues;
+      const first = issues?.[0];
+      if (first) {
+        const field = first.path?.join(".");
+        return `Arena menolak data: ${first.message ?? "tidak valid"}${
+          field ? ` (${field})` : ""
+        }`;
+      }
+      return "Arena menolak data yang dikirim.";
+    }
+  }
+  return `HTTP ${status}: ${body.slice(0, 600)}`;
+}
+
 function userInitials(name: string | null, email: string | null) {
   if (name) {
     return name
@@ -48,6 +126,17 @@ export default function Dashboard() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
+  const [bannerError, setBannerError] = useState<string | null>(null);
+
+  // Konfigurasi repo target (disimpan di localStorage browser ini).
+  const [repoConfig, setRepoConfig] = useState<RepoConfig | null>(() =>
+    loadRepoConfig(),
+  );
+  const [repoDialogOpen, setRepoDialogOpen] = useState(false);
+  const [repoInput, setRepoInput] = useState("");
+  const [repoSaving, setRepoSaving] = useState(false);
+  const [repoError, setRepoError] = useState<string | null>(null);
+
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -55,14 +144,93 @@ export default function Dashboard() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Kalau repo diatur via Keys (env) dan belum ada konfigurasi lokal, pakai itu.
+  useEffect(() => {
+    if (
+      session?.repoConfigured &&
+      session.repoId &&
+      !loadRepoConfig()
+    ) {
+      setRepoConfig({
+        repoOwner: session.repoOwner,
+        repoName: session.repoName,
+        repoId: session.repoId,
+      });
+    }
+  }, [session]);
+
   if (!isLoading && !session) {
     return <Navigate to="/auth" replace />;
   }
 
+  const openRepoDialog = () => {
+    setRepoError(null);
+    setRepoInput(
+      repoConfig ? `${repoConfig.repoOwner}/${repoConfig.repoName}` : "",
+    );
+    setRepoDialogOpen(true);
+  };
+
+  const handleSaveRepo = async () => {
+    const value = repoInput
+      .trim()
+      .replace(/^https?:\/\/github\.com\//, "")
+      .replace(/\/+$/, "");
+    const parts = value.split("/").filter(Boolean);
+    if (parts.length < 2) {
+      setRepoError("Format: username/nama-repo (contoh: facebook/react)");
+      return;
+    }
+    const [owner, name] = parts;
+    setRepoSaving(true);
+    setRepoError(null);
+    try {
+      const res = await fetch(`https://api.github.com/repos/${owner}/${name}`, {
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      if (!res.ok) {
+        if (res.status === 404) {
+          throw new Error(
+            "Repo tidak ditemukan di GitHub. Periksa pemilik dan nama repo.",
+          );
+        }
+        throw new Error(`GitHub API error ${res.status}`);
+      }
+      const data = (await res.json()) as { id?: number };
+      if (!data.id) {
+        throw new Error("GitHub tidak mengembalikan id repo.");
+      }
+      const config: RepoConfig = {
+        repoOwner: owner,
+        repoName: name,
+        repoId: data.id,
+      };
+      saveRepoConfig(config);
+      setRepoConfig(config);
+      setRepoDialogOpen(false);
+    } catch (err) {
+      setRepoError(
+        err instanceof Error ? err.message : "Gagal mengambil info repo.",
+      );
+    } finally {
+      setRepoSaving(false);
+    }
+  };
+
   const handleSend = async (raw?: string) => {
     const message = (raw ?? input).trim();
     if (!message || isStreaming) return;
+
+    if (!repoConfig) {
+      setBannerError(
+        "Repo target belum diatur — Arena menolak chat tanpa repo. Atur dulu lewat tombol repo di kanan atas.",
+      );
+      openRepoDialog();
+      return;
+    }
+
     setInput("");
+    setBannerError(null);
     setIsStreaming(true);
 
     const userMessage: Message = {
@@ -85,19 +253,18 @@ export default function Dashboard() {
       const res = await fetch(`${CONVEX_SITE_URL}/arena/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ clientId, message }),
+        body: JSON.stringify({
+          clientId,
+          message,
+          repoOwner: repoConfig.repoOwner,
+          repoName: repoConfig.repoName,
+          repoId: repoConfig.repoId,
+        }),
       });
 
       if (!res.ok) {
         const text = await res.text();
-        let detail = text;
-        try {
-          const parsed = JSON.parse(text) as { error?: string };
-          detail = parsed.error ?? text;
-        } catch {
-          // bukan JSON — pakai teks apa adanya
-        }
-        throw new Error(detail || `HTTP ${res.status}`);
+        throw new Error(formatArenaError(res.status, text));
       }
 
       const reader = res.body!.getReader();
@@ -125,11 +292,7 @@ export default function Dashboard() {
           m.id === assistantId
             ? {
                 ...m,
-                content:
-                  detail +
-                  (detail.includes("Sesi belum login")
-                    ? " — login ulang lewat halaman masuk."
-                    : ""),
+                content: detail,
                 status: "error",
               }
             : m,
@@ -168,19 +331,28 @@ export default function Dashboard() {
           </Link>
 
           <div className="flex items-center gap-2">
-            {session?.repoConfigured ? (
-              <Badge className="border-emerald-500/30 bg-emerald-500/10 text-emerald-400">
-                <GitBranch className="size-3" />
-                {session.repoOwner}/{session.repoName}
-              </Badge>
-            ) : (
-              <Badge
-                title="Set ARENA_REPO_ID, ARENA_REPO_OWNER, dan ARENA_REPO_NAME (Keys/API keys) agar agent menargetkan repo-mu. Tanpa itu, arena.ai bisa membalas error not_connected."
-                className="border-amber-500/30 bg-amber-500/10 text-amber-400"
+            {repoConfig ? (
+              <button
+                type="button"
+                onClick={openRepoDialog}
+                title="Ubah repo target (Arena butuh repo untuk diproses)"
               >
-                <TriangleAlert className="size-3" />
-                Repo belum diset
-              </Badge>
+                <Badge className="border-emerald-500/30 bg-emerald-500/10 text-emerald-400 transition-colors hover:bg-emerald-500/20">
+                  <GitBranch className="size-3" />
+                  {repoConfig.repoOwner}/{repoConfig.repoName}
+                </Badge>
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={openRepoDialog}
+                title="Arena menolak chat tanpa repo. Klik untuk mengatur."
+              >
+                <Badge className="border-amber-500/30 bg-amber-500/10 text-amber-400 transition-colors hover:bg-amber-500/20">
+                  <TriangleAlert className="size-3" />
+                  Atur repo
+                </Badge>
+              </button>
             )}
             <Badge
               variant="outline"
@@ -189,9 +361,7 @@ export default function Dashboard() {
               <span className="flex size-5 items-center justify-center rounded-full bg-emerald-500/20 text-[10px] font-bold text-emerald-400">
                 {userInitials(session?.name ?? null, session?.email ?? null)}
               </span>
-              <span className="max-w-32 truncate text-xs">
-                {displayName}
-              </span>
+              <span className="max-w-32 truncate text-xs">{displayName}</span>
             </Badge>
             <Button
               type="button"
@@ -224,7 +394,8 @@ export default function Dashboard() {
                 <code className="rounded bg-black/40 px-1.5 py-0.5 font-mono text-[12px] text-emerald-300">
                   arena_agent_test.py
                 </code>
-                .
+                . Pastikan repo target sudah diatur (badge hijau di pojok kanan
+                atas).
               </p>
               <div className="mt-6 flex flex-wrap justify-center gap-2">
                 {[
@@ -236,13 +407,24 @@ export default function Dashboard() {
                     key={suggestion}
                     type="button"
                     onClick={() => handleSend(suggestion)}
-                    disabled={isStreaming}
-                    className="rounded-full border border-white/10 bg-card/60 px-3 py-1.5 font-mono text-xs text-muted-foreground transition-colors hover:border-emerald-500/40 hover:text-emerald-300"
+                    disabled={isStreaming || !repoConfig}
+                    className="rounded-full border border-white/10 bg-card/60 px-3 py-1.5 font-mono text-xs text-muted-foreground transition-colors hover:border-emerald-500/40 hover:text-emerald-300 disabled:opacity-50"
                   >
                     {suggestion}
                   </button>
                 ))}
               </div>
+              {!repoConfig && (
+                <Button
+                  type="button"
+                  onClick={openRepoDialog}
+                  variant="outline"
+                  className="mt-6 h-10"
+                >
+                  <GitBranch className="size-4" />
+                  Atur repo target dulu
+                </Button>
+              )}
             </div>
           ) : (
             <div className="space-y-5">
@@ -280,7 +462,9 @@ export default function Dashboard() {
                         </span>
                       )
                     ) : (
-                      <p className="whitespace-pre-wrap break-words">{message.content}</p>
+                      <p className="whitespace-pre-wrap break-words">
+                        {message.content}
+                      </p>
                     )}
                   </div>
                 </div>
@@ -294,6 +478,18 @@ export default function Dashboard() {
       {/* Composer */}
       <footer className="border-t border-white/10 bg-card/40 backdrop-blur">
         <div className="mx-auto w-full max-w-3xl px-4 py-3">
+          {bannerError && (
+            <div className="mb-2 flex items-start justify-between gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs leading-relaxed text-red-300">
+              <span>{bannerError}</span>
+              <button
+                type="button"
+                onClick={() => setBannerError(null)}
+                className="shrink-0 underline underline-offset-2 hover:text-red-200"
+              >
+                tutup
+              </button>
+            </div>
+          )}
           <div className="flex items-end gap-2">
             <Textarea
               ref={inputRef}
@@ -308,7 +504,9 @@ export default function Dashboard() {
               placeholder={
                 isStreaming
                   ? "Agent sedang membalas..."
-                  : "Tulis pesan untuk Agent Mode… (Enter untuk kirim)"
+                  : repoConfig
+                    ? "Tulis pesan untuk Agent Mode… (Enter untuk kirim)"
+                    : "Atur repo target dulu, lalu tulis pesan…"
               }
               rows={1}
               disabled={isStreaming}
@@ -334,6 +532,66 @@ export default function Dashboard() {
           </p>
         </div>
       </footer>
+
+      {/* Dialog pengaturan repo */}
+      <Dialog open={repoDialogOpen} onOpenChange={setRepoDialogOpen}>
+        <DialogContent className="border-white/10 bg-card text-foreground">
+          <DialogHeader>
+            <DialogTitle>Repo target</DialogTitle>
+            <DialogDescription>
+              Arena Agent menolak chat tanpa repo. Masukkan owner dan nama repo
+              GitHub — ID repo diambil otomatis dari GitHub.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Input
+              value={repoInput}
+              onChange={(e) => setRepoInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void handleSaveRepo();
+                }
+              }}
+              placeholder="username/nama-repo"
+              spellCheck={false}
+              className="border-white/10 bg-black/30 font-mono placeholder:text-muted-foreground/50"
+            />
+            {repoError && (
+              <p className="text-xs leading-relaxed text-red-300">
+                {repoError}
+              </p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setRepoDialogOpen(false)}
+            >
+              Batal
+            </Button>
+            <Button
+              type="button"
+              onClick={() => void handleSaveRepo()}
+              disabled={repoSaving}
+              className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+            >
+              {repoSaving ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  Memeriksa...
+                </>
+              ) : (
+                <>
+                  <GitBranch className="size-4" />
+                  Simpan repo
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -120,9 +120,15 @@ export const streamChat = httpAction(async (ctx, request) => {
     return jsonResponse({ error: "Method not allowed" }, 405);
   }
 
-  let body: { clientId?: string; message?: string };
+  let body: {
+    clientId?: string;
+    message?: string;
+    repoOwner?: string;
+    repoName?: string;
+    repoId?: number;
+  };
   try {
-    body = (await request.json()) as { clientId?: string; message?: string };
+    body = (await request.json()) as typeof body;
   } catch {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
   }
@@ -145,10 +151,29 @@ export const streamChat = httpAction(async (ctx, request) => {
     );
   }
 
+  // Repo target: dari body (dikonfigurasi di UI) atau fallback env (Keys).
+  // Arena butuh repoId berupa ANGKA + owner/nama yang valid — kalau kosong,
+  // API menolak dengan ZodError 400.
+  const repoOwner = body.repoOwner?.trim() || process.env.ARENA_REPO_OWNER || "";
+  const repoName = body.repoName?.trim() || process.env.ARENA_REPO_NAME || "";
+  const envRepoId = Number(process.env.ARENA_REPO_ID ?? "");
+  const repoId =
+    body.repoId ?? (Number.isFinite(envRepoId) && envRepoId > 0 ? envRepoId : 0);
+
+  if (!repoOwner || !repoName || !repoId) {
+    return jsonResponse(
+      {
+        error:
+          "Repo target belum dikonfigurasi. Atur repo (owner/nama) lewat tombol repo di halaman chat.",
+      },
+      400,
+    );
+  }
+
   const payload = {
-    repoId: process.env.ARENA_REPO_ID ?? "",
-    repoOwner: process.env.ARENA_REPO_OWNER ?? "",
-    repoName: process.env.ARENA_REPO_NAME ?? "",
+    repoId,
+    repoOwner,
+    repoName,
     baseBranch: "main",
     message,
   };
@@ -178,4 +203,106 @@ export const streamChat = httpAction(async (ctx, request) => {
       "Content-Type": res.headers.get("content-type") ?? "text/event-stream",
     },
   });
+});
+
+// ====== DEBUG (sementara, untuk tes via `bunx convex run`) ======
+
+type FirstSession = {
+  clientId: string;
+  cookie: string;
+  name: string | null;
+  email: string | null;
+  updatedAt: number;
+} | null;
+
+export const debugMe = action({
+  args: {},
+  handler: async (ctx): Promise<Record<string, unknown>> => {
+    const session: FirstSession = await ctx.runQuery(
+      internal.arenaSession.firstSession,
+      {},
+    );
+    if (!session) {
+      return { error: "Tidak ada sesi tersimpan di Convex. Login dulu dari browser." };
+    }
+    const res = await fetch(`${BASE}/api/me`, {
+      headers: arenaHeaders(session.cookie),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const body = await res.text();
+    return {
+      sessionClientId: session.clientId,
+      sessionUser: session.email ?? session.name ?? "?",
+      status: res.status,
+      user: extractUser(body),
+      bodyPreview: body.slice(0, 400),
+    };
+  },
+});
+
+export const debugChat = action({
+  args: {
+    message: v.optional(v.string()),
+    repoOwner: v.optional(v.string()),
+    repoName: v.optional(v.string()),
+    repoId: v.optional(v.number()),
+  },
+  handler: async (
+    ctx,
+    { message, repoOwner, repoName, repoId },
+  ): Promise<Record<string, unknown>> => {
+    const session: FirstSession = await ctx.runQuery(
+      internal.arenaSession.firstSession,
+      {},
+    );
+    if (!session) {
+      return { error: "Tidak ada sesi tersimpan di Convex. Login dulu dari browser." };
+    }
+    const payload = {
+      repoId: repoId ?? Number(process.env.ARENA_REPO_ID ?? 0),
+      repoOwner: repoOwner ?? process.env.ARENA_REPO_OWNER ?? "",
+      repoName: repoName ?? process.env.ARENA_REPO_NAME ?? "",
+      baseBranch: "main",
+      message: message ?? "halo, ini tes debug dari web",
+    };
+    let res: Response;
+    try {
+      res = await fetch(`${BASE}/api/coding-agent/sessions`, {
+        method: "POST",
+        headers: arenaHeaders(session.cookie, true),
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(25_000),
+      });
+    } catch (error) {
+      return {
+        error: `fetch gagal: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    const contentType = res.headers.get("content-type") ?? "?";
+    let body = "";
+    const deadline = Date.now() + 18_000;
+    try {
+      const reader = res.body?.getReader();
+      if (reader) {
+        const decoder = new TextDecoder();
+        while (Date.now() < deadline) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          body += decoder.decode(value, { stream: true });
+        }
+        await reader.cancel().catch(() => {});
+      } else {
+        body = await res.text();
+      }
+    } catch (error) {
+      body += `\n[read error] ${error instanceof Error ? error.message : String(error)}`;
+    }
+    return {
+      repoPayload: payload,
+      status: res.status,
+      contentType,
+      bodyLength: body.length,
+      bodyPreview: body.slice(0, 4000),
+    };
+  },
 });

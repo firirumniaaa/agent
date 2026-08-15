@@ -49,8 +49,8 @@ const FEATURES = [
   },
   {
     icon: Zap,
-    title: "Tanpa setup repo",
-    body: "Opsional: set ARENA_REPO_ID / OWNER / NAME lewat Keys untuk menautkan repo target.",
+    title: "Repo target fleksibel",
+    body: "Pilih repo GitHub tujuan dari dashboard — ID repo diambil otomatis dari GitHub, tanpa perlu Keys.",
   },
 ];
 
