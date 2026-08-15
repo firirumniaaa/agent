@@ -60,6 +60,21 @@ export const firstSession = internalQuery({
   },
 });
 
+/** Debug: URL situs Convex + clientId sesi terbaru (untuk tes console). */
+export const debugInfo = query({
+  args: {},
+  handler: async (ctx) => {
+    const session = await ctx.db
+      .query("arenaSessions")
+      .order("desc")
+      .first();
+    return {
+      siteUrl: process.env.CONVEX_SITE_URL ?? "",
+      clientId: session?.clientId ?? null,
+    };
+  },
+});
+
 /** Info sesi aktif untuk browser (tanpa cookie). */
 export const me = query({
   args: { clientId: v.string() },
