@@ -1,5 +1,5 @@
 import { ConvexError, v } from "convex/values";
-import { internal } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import { action, httpAction } from "./_generated/server";
 
 const BASE = "https://arena.ai";
@@ -320,6 +320,42 @@ export const streamChat = httpAction(async (ctx, request) => {
       "Content-Type": res.headers.get("content-type") ?? "text/event-stream",
     },
   });
+});
+
+/**
+ * Buat akun arena.ai otomatis via email sementara (mail.tm) lalu simpan
+ * sesinya untuk clientId ini. Alur yang dipakai (sudah terbukti):
+ *   anon sign-up -> magic-link -> callback -> set-password -> sesi v1.0/v1.1
+ * Hasil akhir: /api/me 200 DAN auth create-chat lolos (tinggal token
+ * reCAPTCHA dari browser saat chat). Khusus untuk tes — akun email temp.
+ */
+export const registerTempAccount = action({
+  args: { clientId: v.string() },
+  handler: async (ctx, { clientId }) => {
+    const result = (await ctx.runAction(
+      api.arenaDebug.debugAnonUpgradeViaMagicLink,
+      { clientId },
+    )) as Record<string, unknown>;
+    const log = (result.log as Array<Record<string, unknown>> | undefined) ?? [];
+    const step = (name: string) =>
+      log.find((l) => l.step === name) ?? null;
+    const signup = step("signup-anon");
+    const setPassword = step("set-password");
+    const me = step("me");
+    const chat = step("chat-null-token");
+    return {
+      ok: Boolean(me && (me.status === 200 || me.status === 201)),
+      address: typeof result.address === "string" ? result.address : null,
+      password: typeof result.password === "string" ? result.password : null,
+      hasV10: Boolean(result.hasV10),
+      steps: {
+        signup: signup?.status ?? null,
+        setPassword: setPassword?.status ?? null,
+        me: me?.status ?? null,
+        chatAuth: chat?.status ?? null, // 403 = auth lolos, tinggal recaptcha
+      },
+    };
+  },
 });
 
 // ====== DEBUG (sementara, untuk tes via `bunx convex run`) ======

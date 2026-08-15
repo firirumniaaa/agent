@@ -16,8 +16,10 @@ import {
   Cookie,
   KeyRound,
   Loader2,
+  Sparkles,
   TerminalSquare,
   TriangleAlert,
+  UserPlus,
 } from "lucide-react";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
@@ -38,12 +40,16 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
   const [searchParams] = useSearchParams();
   const redirect = resolveRedirect(searchParams.get("returnTo"), redirectAfterAuth);
   const login = useAction(api.arena.login);
+  const registerTemp = useAction(api.arena.registerTempAccount);
 
   const { clientId, session, isLoading: sessionLoading } = useArenaSession();
   const [cookie, setCookie] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copiedBookmarklet, setCopiedBookmarklet] = useState(false);
+  // Buat akun tes otomatis (email sementara)
+  const [isRegistering, setIsRegistering] = useState(false);
+  const [registerError, setRegisterError] = useState<string | null>(null);
 
   // Feedback real-time soal kelengkapan cookie yang ditempel.
   const detected = useMemo(() => detectedCookieNames(cookie), [cookie]);
@@ -90,6 +96,31 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
       setTimeout(() => setCopiedBookmarklet(false), 2000);
     } catch {
       // abaikan — user bisa salin manual dari <code>
+    }
+  };
+
+  // Buat akun arena baru via email sementara: anon sign-up -> magic-link ->
+  // set-password. Sesi disimpan untuk clientId ini, user langsung masuk.
+  const handleRegisterTemp = async () => {
+    setIsRegistering(true);
+    setRegisterError(null);
+    try {
+      const result = await registerTemp({ clientId });
+      if (result.ok) {
+        navigate(redirect, { replace: true });
+      } else {
+        setRegisterError(
+          `Gagal membuat akun (signup=${result.steps.signup ?? "?"}, setPassword=${result.steps.setPassword ?? "?"}, me=${result.steps.me ?? "?"}). Coba lagi, atau tempel cookie manual di atas.`,
+        );
+      }
+    } catch (err) {
+      setRegisterError(
+        err instanceof Error
+          ? err.message
+          : "Gagal membuat akun tes. Coba lagi.",
+      );
+    } finally {
+      setIsRegistering(false);
     }
   };
 
@@ -227,6 +258,46 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
             )}
           </Button>
         </form>
+
+        {/* Buat akun tes otomatis */}
+        <div className="mt-6 rounded-2xl border border-emerald-500/20 bg-emerald-500/5 p-5 text-sm">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="flex items-center gap-2 font-medium">
+                <Sparkles className="size-4 text-emerald-400" />
+                Belum punya akun arena? Buat otomatis (email sementara)
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                Server membuat akun baru via email sementara (anon sign-up →
+                magic-link → set-password), sesi langsung tersimpan — kamu
+                langsung masuk dashboard. Butuh waktu ±1 menit.
+              </p>
+            </div>
+            <Button
+              type="button"
+              onClick={handleRegisterTemp}
+              disabled={isRegistering || isSubmitting}
+              className="shrink-0 bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+            >
+              {isRegistering ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  Membuat akun...
+                </>
+              ) : (
+                <>
+                  <UserPlus className="size-4" />
+                  Buat akun tes
+                </>
+              )}
+            </Button>
+          </div>
+          {registerError && (
+            <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2.5 text-xs leading-relaxed text-red-300">
+              {registerError}
+            </div>
+          )}
+        </div>
 
         {/* Cara ambil cookie */}
         <div className="mt-6 rounded-2xl border border-white/10 bg-card/40 p-5 text-sm">

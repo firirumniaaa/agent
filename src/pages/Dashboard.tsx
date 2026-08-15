@@ -1,6 +1,10 @@
 import { api } from "@/convex/_generated/api";
 import { useArenaSession } from "@/hooks/use-arena-session";
-import { getArenaRecaptchaToken } from "@/lib/recaptcha";
+import {
+  ARENA_RECAPTCHA_BOOKMARKLET,
+  getArenaRecaptchaToken,
+  isRecaptchaError,
+} from "@/lib/recaptcha";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -52,6 +56,11 @@ export default function Dashboard() {
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [bannerError, setBannerError] = useState<string | null>(null);
+  // Token reCAPTCHA manual (dari bookmarklet di arena.ai) — fallback saat
+  // token yang di-mint otomatis di browser kita ditolak arena.
+  const [manualToken, setManualToken] = useState("");
+  const [showTokenPanel, setShowTokenPanel] = useState(false);
+  const [copiedBookmarklet, setCopiedBookmarklet] = useState(false);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -96,15 +105,22 @@ export default function Dashboard() {
     };
 
     try {
+      const trimmedManual = manualToken.trim();
       let token: string;
-      try {
-        token = await getArenaRecaptchaToken();
-      } catch (err) {
-        throw new Error(
-          err instanceof Error
-            ? err.message
-            : "Gagal mendapatkan token reCAPTCHA.",
-        );
+      if (trimmedManual) {
+        // Token manual dari bookmarklet arena.ai — sudah terbukti diterima.
+        token = trimmedManual;
+        setManualToken("");
+      } else {
+        try {
+          token = await getArenaRecaptchaToken();
+        } catch (err) {
+          throw new Error(
+            err instanceof Error
+              ? err.message
+              : "Gagal mendapatkan token reCAPTCHA.",
+          );
+        }
       }
 
       const res = await fetch(`${CONVEX_SITE_URL}/arena/stream`, {
@@ -128,7 +144,14 @@ export default function Dashboard() {
       }
 
       if (!res.ok || !parsed.ok) {
-        throw new Error(parsed.error || `HTTP ${res.status}: ${text.slice(0, 200)}`);
+        const detail = parsed.error || `HTTP ${res.status}: ${text.slice(0, 200)}`;
+        if (isRecaptchaError(detail)) {
+          setShowTokenPanel(true);
+          setBannerError(
+            "Token reCAPTCHA ditolak arena. Ambil token FRESH dari arena.ai lewat bookmarklet di bawah, lalu kirim ulang. (Token cuma berlaku ±2 menit dan sekali pakai.)",
+          );
+        }
+        throw new Error(detail);
       }
 
       // Chat berhasil dibuat — jawaban agent mengalir di halaman arena.ai.
@@ -158,6 +181,16 @@ export default function Dashboard() {
   const handleSignOut = async () => {
     await logout({ clientId });
     navigate("/");
+  };
+
+  const copyRecaptchaBookmarklet = async () => {
+    try {
+      await navigator.clipboard.writeText(ARENA_RECAPTCHA_BOOKMARKLET);
+      setCopiedBookmarklet(true);
+      setTimeout(() => setCopiedBookmarklet(false), 2000);
+    } catch {
+      // abaikan — user bisa salin manual dari <code>
+    }
   };
 
   const displayName = session?.name || session?.email || "Arena user";
@@ -323,6 +356,62 @@ export default function Dashboard() {
       {/* Composer */}
       <footer className="border-t border-white/10 bg-card/40 backdrop-blur">
         <div className="mx-auto w-full max-w-3xl px-4 py-3">
+          {/* Panel token reCAPTCHA manual — fallback saat token otomatis ditolak */}
+          <div className="mb-2">
+            <button
+              type="button"
+              onClick={() => setShowTokenPanel((v) => !v)}
+              className="flex items-center gap-1.5 text-[11px] text-muted-foreground underline underline-offset-2 hover:text-emerald-300"
+            >
+              {showTokenPanel ? "▾" : "▸"} Token reCAPTCHA manual
+            </button>
+            {showTokenPanel && (
+              <div className="mt-2 rounded-xl border border-amber-500/25 bg-amber-500/5 p-3">
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  Kalau token otomatis ditolak arena (403{" "}
+                  <code className="font-mono">recaptcha validation failed</code>
+                  ), ambil token FRESH dari halaman arena.ai: buka{" "}
+                  <a
+                    href="https://arena.ai/agent"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-emerald-400 underline underline-offset-2 hover:text-emerald-300"
+                  >
+                    arena.ai/agent
+                  </a>{" "}
+                  → klik bookmarklet di bawah → token tersalin → tempel di sini →
+                  kirim ulang. Token berlaku ±2 menit & sekali pakai.
+                </p>
+                <div className="mt-2 flex items-start gap-2">
+                  <code className="max-h-16 flex-1 overflow-y-auto rounded-lg border border-white/10 bg-black/40 px-2.5 py-1.5 font-mono text-[9.5px] leading-relaxed text-emerald-300">
+                    {ARENA_RECAPTCHA_BOOKMARKLET}
+                  </code>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={copyRecaptchaBookmarklet}
+                    className="shrink-0 border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 hover:text-emerald-300"
+                  >
+                    {copiedBookmarklet ? "Tersalin ✓" : "Salin bookmarklet"}
+                  </Button>
+                </div>
+                <Textarea
+                  value={manualToken}
+                  onChange={(e) => setManualToken(e.target.value)}
+                  placeholder="Tempel token reCAPTCHA di sini (mulai dengan 0cAFcWeA…)"
+                  rows={2}
+                  spellCheck={false}
+                  className="mt-2 min-h-16 resize-none border-white/10 bg-black/30 font-mono text-[10.5px] leading-relaxed placeholder:text-muted-foreground/40"
+                />
+                <p className="mt-1.5 text-[10.5px] text-muted-foreground/70">
+                  Cara buat bookmarklet: bookmark baru → tempel kode sebagai
+                  alamat → jalankan di arena.ai/agent saat sudah login.
+                </p>
+              </div>
+            )}
+          </div>
+
           {bannerError && (
             <div className="mb-2 flex items-start justify-between gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs leading-relaxed text-red-300">
               <span>{bannerError}</span>
