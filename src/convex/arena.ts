@@ -443,7 +443,8 @@ async function createChatWithCookie(
     recaptchaV3Token: token,
   };
   const headers: Record<string, string> = {
-    "User-Agent": UA,
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     Accept: "application/json, text/event-stream, */*",
     Cookie: cookie,
   };
@@ -522,6 +523,70 @@ export const debugToken = action({
       "https://arena.ai",
     );
     return { status: res.status, body: res.body };
+  },
+});
+
+// Tes auth arena: apakah sign-in/email butuh recaptcha?
+export const debugAuth = action({
+  args: {
+    email: v.optional(v.string()),
+    password: v.optional(v.string()),
+  },
+  handler: async (
+    ctx,
+    { email, password },
+  ): Promise<Record<string, unknown>> => {
+    const payload: Record<string, unknown> = {
+      email: email ?? "wondywansy@gmail.com",
+      password: password ?? "wrong-password-test-123",
+      shouldLinkHistory: false,
+    };
+    const results = [];
+
+    // Varian 1: tanpa recaptcha
+    {
+      const res = await fetch(`${BASE}/nextjs-api/sign-in/email`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": UA,
+          Origin: BASE,
+          Referer: BASE + "/agent",
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(20_000),
+      });
+      results.push({
+        variant: "no-recaptcha",
+        status: res.status,
+        setCookie: res.headers.get("set-cookie")?.slice(0, 120) ?? null,
+        body: (await res.text()).slice(0, 300),
+      });
+    }
+
+    // Varian 2: dengan token mint-server (lmarena)
+    const token = await mintRecaptchaToken();
+    if (token) {
+      const res = await fetch(`${BASE}/nextjs-api/sign-in/email`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": UA,
+          Origin: BASE,
+          Referer: BASE + "/agent",
+        },
+        body: JSON.stringify({ ...payload, recaptchaToken: token }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      results.push({
+        variant: "with-recaptcha",
+        status: res.status,
+        setCookie: res.headers.get("set-cookie")?.slice(0, 120) ?? null,
+        body: (await res.text()).slice(0, 300),
+      });
+    }
+
+    return { results };
   },
 });
 
