@@ -1,26 +1,16 @@
 import { api } from "@/convex/_generated/api";
 import { useArenaSession } from "@/hooks/use-arena-session";
+import { getArenaRecaptchaToken } from "@/lib/recaptcha";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useMutation } from "convex/react";
 import {
   Bot,
-  GitBranch,
-  Loader2,
+  ExternalLink,
   LogOut,
   Send,
   TerminalSquare,
-  TriangleAlert,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, Navigate, useNavigate } from "react-router";
@@ -30,6 +20,8 @@ const CONVEX_SITE_URL = (import.meta.env.VITE_CONVEX_URL as string).replace(
   ".site",
 );
 
+const ARENA_AGENT_URL = "https://arena.ai/agent";
+
 type MessageStatus = "streaming" | "error" | "done";
 
 interface Message {
@@ -37,74 +29,7 @@ interface Message {
   role: "user" | "assistant";
   content: string;
   status?: MessageStatus;
-}
-
-interface RepoConfig {
-  repoOwner: string;
-  repoName: string;
-  repoId: number;
-}
-
-const REPO_KEY = "arena:repo";
-
-function loadRepoConfig(): RepoConfig | null {
-  try {
-    const raw = window.localStorage.getItem(REPO_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as RepoConfig;
-    if (
-      parsed.repoOwner &&
-      parsed.repoName &&
-      typeof parsed.repoId === "number" &&
-      parsed.repoId > 0
-    ) {
-      return parsed;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function saveRepoConfig(config: RepoConfig) {
-  window.localStorage.setItem(REPO_KEY, JSON.stringify(config));
-}
-
-/** Ubah body error arena.ai (JSON polos / ZodError) jadi pesan yang jelas. */
-function formatArenaError(status: number, body: string): string {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return body.slice(0, 600);
-  }
-  if (parsed && typeof parsed === "object") {
-    const obj = parsed as { error?: unknown; success?: boolean };
-    const err = obj.error;
-    if (typeof err === "string") {
-      if (err === "coding_agent_disabled") {
-        return (
-          "Arena menolak: fitur coding agent dinonaktifkan di akun arena.ai kamu. " +
-          "Aktifkan Agent Mode dan sambungkan GitHub di arena.ai, lalu coba lagi."
-        );
-      }
-      return err;
-    }
-    if (obj.success === false && err && typeof err === "object") {
-      const issues = (err as {
-        issues?: { path?: Array<string | number>; message?: string }[];
-      }).issues;
-      const first = issues?.[0];
-      if (first) {
-        const field = first.path?.join(".");
-        return `Arena menolak data: ${first.message ?? "tidak valid"}${
-          field ? ` (${field})` : ""
-        }`;
-      }
-      return "Arena menolak data yang dikirim.";
-    }
-  }
-  return `HTTP ${status}: ${body.slice(0, 600)}`;
+  sessionId?: string;
 }
 
 function userInitials(name: string | null, email: string | null) {
@@ -128,15 +53,6 @@ export default function Dashboard() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [bannerError, setBannerError] = useState<string | null>(null);
 
-  // Konfigurasi repo target (disimpan di localStorage browser ini).
-  const [repoConfig, setRepoConfig] = useState<RepoConfig | null>(() =>
-    loadRepoConfig(),
-  );
-  const [repoDialogOpen, setRepoDialogOpen] = useState(false);
-  const [repoInput, setRepoInput] = useState("");
-  const [repoSaving, setRepoSaving] = useState(false);
-  const [repoError, setRepoError] = useState<string | null>(null);
-
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -144,90 +60,13 @@ export default function Dashboard() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Kalau repo diatur via Keys (env) dan belum ada konfigurasi lokal, pakai itu.
-  useEffect(() => {
-    if (
-      session?.repoConfigured &&
-      session.repoId &&
-      !loadRepoConfig()
-    ) {
-      setRepoConfig({
-        repoOwner: session.repoOwner,
-        repoName: session.repoName,
-        repoId: session.repoId,
-      });
-    }
-  }, [session]);
-
   if (!isLoading && !session) {
     return <Navigate to="/auth" replace />;
   }
 
-  const openRepoDialog = () => {
-    setRepoError(null);
-    setRepoInput(
-      repoConfig ? `${repoConfig.repoOwner}/${repoConfig.repoName}` : "",
-    );
-    setRepoDialogOpen(true);
-  };
-
-  const handleSaveRepo = async () => {
-    const value = repoInput
-      .trim()
-      .replace(/^https?:\/\/github\.com\//, "")
-      .replace(/\/+$/, "");
-    const parts = value.split("/").filter(Boolean);
-    if (parts.length < 2) {
-      setRepoError("Format: username/nama-repo (contoh: facebook/react)");
-      return;
-    }
-    const [owner, name] = parts;
-    setRepoSaving(true);
-    setRepoError(null);
-    try {
-      const res = await fetch(`https://api.github.com/repos/${owner}/${name}`, {
-        headers: { Accept: "application/vnd.github+json" },
-      });
-      if (!res.ok) {
-        if (res.status === 404) {
-          throw new Error(
-            "Repo tidak ditemukan di GitHub. Periksa pemilik dan nama repo.",
-          );
-        }
-        throw new Error(`GitHub API error ${res.status}`);
-      }
-      const data = (await res.json()) as { id?: number };
-      if (!data.id) {
-        throw new Error("GitHub tidak mengembalikan id repo.");
-      }
-      const config: RepoConfig = {
-        repoOwner: owner,
-        repoName: name,
-        repoId: data.id,
-      };
-      saveRepoConfig(config);
-      setRepoConfig(config);
-      setRepoDialogOpen(false);
-    } catch (err) {
-      setRepoError(
-        err instanceof Error ? err.message : "Gagal mengambil info repo.",
-      );
-    } finally {
-      setRepoSaving(false);
-    }
-  };
-
   const handleSend = async (raw?: string) => {
     const message = (raw ?? input).trim();
     if (!message || isStreaming) return;
-
-    if (!repoConfig) {
-      setBannerError(
-        "Repo target belum diatur — Arena menolak chat tanpa repo. Atur dulu lewat tombol repo di kanan atas.",
-      );
-      openRepoDialog();
-      return;
-    }
 
     setInput("");
     setBannerError(null);
@@ -248,55 +87,67 @@ export default function Dashboard() {
     };
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
 
-    let received = "";
+    const finishError = (detail: string) => {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantId ? { ...m, content: detail, status: "error" } : m,
+        ),
+      );
+    };
+
     try {
+      let token: string;
+      try {
+        token = await getArenaRecaptchaToken();
+      } catch (err) {
+        throw new Error(
+          err instanceof Error
+            ? err.message
+            : "Gagal mendapatkan token reCAPTCHA.",
+        );
+      }
+
       const res = await fetch(`${CONVEX_SITE_URL}/arena/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           clientId,
           message,
-          repoOwner: repoConfig.repoOwner,
-          repoName: repoConfig.repoName,
-          repoId: repoConfig.repoId,
+          mode: "chat",
+          recaptchaV3Token: token,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         }),
       });
 
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(formatArenaError(res.status, text));
+      const text = await res.text();
+      let parsed: { ok?: boolean; sessionId?: string; error?: string };
+      try {
+        parsed = JSON.parse(text) as typeof parsed;
+      } catch {
+        parsed = {};
       }
 
-      const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        received += decoder.decode(value, { stream: true });
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantId ? { ...m, content: received } : m,
-          ),
-        );
+      if (!res.ok || !parsed.ok) {
+        throw new Error(parsed.error || `HTTP ${res.status}: ${text.slice(0, 200)}`);
       }
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantId ? { ...m, status: "done" } : m,
-        ),
-      );
-    } catch (err) {
-      const detail =
-        err instanceof Error ? err.message : "Terjadi kesalahan tak terduga.";
+
+      // Chat berhasil dibuat — jawaban agent mengalir di halaman arena.ai.
+      const sessionId = parsed.sessionId;
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantId
             ? {
                 ...m,
-                content: detail,
-                status: "error",
+                content: "Chat berhasil dibuat di arena.ai.",
+                status: "done",
+                sessionId,
               }
             : m,
         ),
+      );
+    } catch (err) {
+      finishError(
+        err instanceof Error ? err.message : "Terjadi kesalahan tak terduga.",
       );
     } finally {
       setIsStreaming(false);
@@ -331,29 +182,6 @@ export default function Dashboard() {
           </Link>
 
           <div className="flex items-center gap-2">
-            {repoConfig ? (
-              <button
-                type="button"
-                onClick={openRepoDialog}
-                title="Ubah repo target (Arena butuh repo untuk diproses)"
-              >
-                <Badge className="border-emerald-500/30 bg-emerald-500/10 text-emerald-400 transition-colors hover:bg-emerald-500/20">
-                  <GitBranch className="size-3" />
-                  {repoConfig.repoOwner}/{repoConfig.repoName}
-                </Badge>
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={openRepoDialog}
-                title="Arena menolak chat tanpa repo. Klik untuk mengatur."
-              >
-                <Badge className="border-amber-500/30 bg-amber-500/10 text-amber-400 transition-colors hover:bg-amber-500/20">
-                  <TriangleAlert className="size-3" />
-                  Atur repo
-                </Badge>
-              </button>
-            )}
             <Badge
               variant="outline"
               className="hidden gap-1.5 border-white/10 sm:inline-flex"
@@ -389,42 +217,30 @@ export default function Dashboard() {
                 Kirim pesan ke Agent Mode
               </h2>
               <p className="mt-2 max-w-md text-sm leading-relaxed text-muted-foreground">
-                Respons agent akan mengalir di sini secara real-time — sama
-                seperti menjalankan{" "}
+                Tanpa GitHub, tanpa Python — cukup cookie arena.ai. Chat dibuat
+                lewat API{" "}
                 <code className="rounded bg-black/40 px-1.5 py-0.5 font-mono text-[12px] text-emerald-300">
-                  arena_agent_test.py
-                </code>
-                . Pastikan repo target sudah diatur (badge hijau di pojok kanan
-                atas).
+                  create-chat
+                </code>{" "}
+                dan jawaban agent mengalir di halaman arena.ai-mu.
               </p>
               <div className="mt-6 flex flex-wrap justify-center gap-2">
                 {[
                   "halo, ini tes dari web",
-                  "jelaskan isi repo ini",
-                  "tolong perbaiki bug di file utama",
+                  "tolong buatkan puisi tentang coding",
+                  "jelaskan cara kerja reCAPTCHA",
                 ].map((suggestion) => (
                   <button
                     key={suggestion}
                     type="button"
                     onClick={() => handleSend(suggestion)}
-                    disabled={isStreaming || !repoConfig}
+                    disabled={isStreaming}
                     className="rounded-full border border-white/10 bg-card/60 px-3 py-1.5 font-mono text-xs text-muted-foreground transition-colors hover:border-emerald-500/40 hover:text-emerald-300 disabled:opacity-50"
                   >
                     {suggestion}
                   </button>
                 ))}
               </div>
-              {!repoConfig && (
-                <Button
-                  type="button"
-                  onClick={openRepoDialog}
-                  variant="outline"
-                  className="mt-6 h-10"
-                >
-                  <GitBranch className="size-4" />
-                  Atur repo target dulu
-                </Button>
-              )}
             </div>
           ) : (
             <div className="space-y-5">
@@ -448,7 +264,36 @@ export default function Dashboard() {
                     }`}
                   >
                     {message.role === "assistant" ? (
-                      message.content ? (
+                      message.sessionId ? (
+                        <div className="space-y-3">
+                          <p className="flex items-center gap-2 font-medium text-emerald-300">
+                            <Bot className="size-4" />
+                            Chat berhasil dibuat
+                          </p>
+                          <p className="text-xs leading-relaxed text-muted-foreground">
+                            Jawaban agent mengalir di halaman arena.ai (halaman
+                            arena tidak mengizinkan embed, jadi dibuka di tab
+                            baru).
+                          </p>
+                          <Button
+                            asChild
+                            size="sm"
+                            className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+                          >
+                            <a
+                              href={`${ARENA_AGENT_URL}/${message.sessionId}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              Buka jawaban di arena.ai
+                              <ExternalLink className="size-4" />
+                            </a>
+                          </Button>
+                          <p className="break-all font-mono text-[11px] text-muted-foreground/60">
+                            {ARENA_AGENT_URL}/{message.sessionId}
+                          </p>
+                        </div>
+                      ) : message.content ? (
                         <pre className="whitespace-pre-wrap break-words font-mono text-[12.5px] leading-relaxed">
                           {message.content}
                           {message.status === "streaming" && (
@@ -458,7 +303,7 @@ export default function Dashboard() {
                       ) : (
                         <span className="flex items-center gap-2 text-muted-foreground">
                           <span className="inline-block size-3 animate-spin rounded-full border-2 border-emerald-400 border-t-transparent" />
-                          Agent sedang menulis...
+                          Membuat chat di arena.ai...
                         </span>
                       )
                     ) : (
@@ -503,10 +348,8 @@ export default function Dashboard() {
               }}
               placeholder={
                 isStreaming
-                  ? "Agent sedang membalas..."
-                  : repoConfig
-                    ? "Tulis pesan untuk Agent Mode… (Enter untuk kirim)"
-                    : "Atur repo target dulu, lalu tulis pesan…"
+                  ? "Membuat chat di arena.ai..."
+                  : "Tulis pesan untuk Agent Mode… (Enter untuk kirim)"
               }
               rows={1}
               disabled={isStreaming}
@@ -527,71 +370,11 @@ export default function Dashboard() {
             </Button>
           </div>
           <p className="mt-2 text-center text-[11px] text-muted-foreground/70">
-            Pesan dikirim ke arena.ai/coding-agent — cookie sesimu dipakai
-            server-side, tidak pernah tampil di browser.
+            Chat dibuat via arena.ai/nextjs-api/stream/create-chat — cookie
+            sesimu dipakai server-side, tidak pernah tampil di browser.
           </p>
         </div>
       </footer>
-
-      {/* Dialog pengaturan repo */}
-      <Dialog open={repoDialogOpen} onOpenChange={setRepoDialogOpen}>
-        <DialogContent className="border-white/10 bg-card text-foreground">
-          <DialogHeader>
-            <DialogTitle>Repo target</DialogTitle>
-            <DialogDescription>
-              Arena Agent menolak chat tanpa repo. Masukkan owner dan nama repo
-              GitHub — ID repo diambil otomatis dari GitHub.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <Input
-              value={repoInput}
-              onChange={(e) => setRepoInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  void handleSaveRepo();
-                }
-              }}
-              placeholder="username/nama-repo"
-              spellCheck={false}
-              className="border-white/10 bg-black/30 font-mono placeholder:text-muted-foreground/50"
-            />
-            {repoError && (
-              <p className="text-xs leading-relaxed text-red-300">
-                {repoError}
-              </p>
-            )}
-          </div>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setRepoDialogOpen(false)}
-            >
-              Batal
-            </Button>
-            <Button
-              type="button"
-              onClick={() => void handleSaveRepo()}
-              disabled={repoSaving}
-              className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
-            >
-              {repoSaving ? (
-                <>
-                  <Loader2 className="size-4 animate-spin" />
-                  Memeriksa...
-                </>
-              ) : (
-                <>
-                  <GitBranch className="size-4" />
-                  Simpan repo
-                </>
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

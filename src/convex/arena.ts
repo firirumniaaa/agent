@@ -108,9 +108,36 @@ function jsonResponse(
   });
 }
 
+/** Ubah body error JSON arena.ai jadi string yang enak dibaca. */
+function extractArenaError(status: number, text: string): string {
+  try {
+    const parsed = JSON.parse(text) as { error?: unknown; success?: boolean };
+    const err = parsed.error;
+    if (typeof err === "string") return err;
+    if (parsed.success === false && err && typeof err === "object") {
+      const issues = (err as {
+        issues?: { path?: Array<string | number>; message?: string }[];
+      }).issues;
+      const first = issues?.[0];
+      if (first) {
+        return `Data tidak valid: ${first.message ?? "?"}${
+          first.path?.length ? ` (${first.path.join(".")})` : ""
+        }`;
+      }
+    }
+  } catch {
+    // bukan JSON — pakai teks apa adanya
+  }
+  return `HTTP ${status}: ${text.slice(0, 300)}`;
+}
+
 /**
- * Endpoint streaming: klien POST { clientId, message }, lalu respons dari
- * /api/coding-agent/sessions arena.ai diteruskan apa adanya (text/event-stream).
+ * Endpoint chat arena.ai. Dua mode:
+ *  - "chat"   (default): /nextjs-api/stream/create-chat — TANPA GitHub, tapi
+ *    wajib token reCAPTCHA Enterprise yang di-mint di browser klien.
+ *    Respons 200 {id: sessionId} -> dikembalikan sebagai JSON ke klien.
+ *  - "coding": /api/coding-agent/sessions — butuh repo GitHub terhubung;
+ *    stream respons apa adanya (text/event-stream) ke klien.
  */
 export const streamChat = httpAction(async (ctx, request) => {
   if (request.method === "OPTIONS") {
@@ -123,6 +150,9 @@ export const streamChat = httpAction(async (ctx, request) => {
   let body: {
     clientId?: string;
     message?: string;
+    mode?: "chat" | "coding";
+    timezone?: string;
+    recaptchaV3Token?: string | null;
     repoOwner?: string;
     repoName?: string;
     repoId?: number;
@@ -151,9 +181,68 @@ export const streamChat = httpAction(async (ctx, request) => {
     );
   }
 
-  // Repo target: dari body (dikonfigurasi di UI) atau fallback env (Keys).
-  // Arena butuh repoId berupa ANGKA + owner/nama yang valid — kalau kosong,
-  // API menolak dengan ZodError 400.
+  const mode = body.mode === "coding" ? "coding" : "chat";
+
+  // ===== Mode chat biasa (tanpa GitHub, butuh token reCAPTCHA dari browser) =====
+  if (mode === "chat") {
+    const token = body.recaptchaV3Token?.trim();
+    if (!token) {
+      return jsonResponse(
+        {
+          error:
+            "Token reCAPTCHA arena belum tersedia. Muat ulang halaman lalu coba kirim lagi.",
+        },
+        400,
+      );
+    }
+    const payload = {
+      message: {
+        id: crypto.randomUUID(),
+        role: "user",
+        parts: [{ type: "text", text: message }],
+      },
+      timezone: body.timezone?.trim() || "Asia/Jakarta",
+      recaptchaV2Token: null,
+      recaptchaV3Token: token,
+    };
+
+    let res: Response;
+    try {
+      res = await fetch(`${BASE}/nextjs-api/stream/create-chat`, {
+        method: "POST",
+        headers: arenaHeaders(cookie, true),
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(20_000),
+      });
+    } catch (error) {
+      return jsonResponse(
+        {
+          error: `Gagal menghubungi arena.ai: ${error instanceof Error ? error.message : String(error)}`,
+        },
+        502,
+      );
+    }
+
+    const text = await res.text();
+    if (res.status !== 200) {
+      const message = extractArenaError(res.status, text);
+      return jsonResponse({ error: message }, res.status === 403 ? 403 : 502);
+    }
+    try {
+      const parsed = JSON.parse(text) as { id?: string };
+      if (parsed.id) {
+        return jsonResponse({ ok: true, sessionId: parsed.id }, 200);
+      }
+    } catch {
+      // bukan JSON — jatuh ke bawah
+    }
+    return jsonResponse(
+      { error: `Respons create-chat tidak dikenali: ${text.slice(0, 300)}` },
+      502,
+    );
+  }
+
+  // ===== Mode coding (butuh repo GitHub, tanpa recaptcha) =====
   const repoOwner = body.repoOwner?.trim() || process.env.ARENA_REPO_OWNER || "";
   const repoName = body.repoName?.trim() || process.env.ARENA_REPO_NAME || "";
   const envRepoId = Number(process.env.ARENA_REPO_ID ?? "");
@@ -299,6 +388,71 @@ export const debugChat = action({
     }
     return {
       repoPayload: payload,
+      status: res.status,
+      contentType,
+      bodyLength: body.length,
+      bodyPreview: body.slice(0, 4000),
+    };
+  },
+});
+
+export const debugCreateChat = action({
+  args: { message: v.optional(v.string()) },
+  handler: async (
+    ctx,
+    { message },
+  ): Promise<Record<string, unknown>> => {
+    const session: FirstSession = await ctx.runQuery(
+      internal.arenaSession.firstSession,
+      {},
+    );
+    if (!session) {
+      return { error: "Tidak ada sesi tersimpan di Convex. Login dulu dari browser." };
+    }
+    const payload = {
+      message: {
+        id: crypto.randomUUID(),
+        role: "user",
+        parts: [{ type: "text", text: message ?? "halo, ini tes chat biasa dari web" }],
+      },
+      timezone: "Asia/Jakarta",
+      recaptchaV3Token: null,
+      recaptchaV2Token: null,
+    };
+    let res: Response;
+    try {
+      res = await fetch(`${BASE}/nextjs-api/stream/create-chat`, {
+        method: "POST",
+        headers: arenaHeaders(session.cookie, true),
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (error) {
+      return {
+        error: `fetch gagal: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    const contentType = res.headers.get("content-type") ?? "?";
+    let body = "";
+    const deadline = Date.now() + 20_000;
+    try {
+      const reader = res.body?.getReader();
+      if (reader) {
+        const decoder = new TextDecoder();
+        while (Date.now() < deadline) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          body += decoder.decode(value, { stream: true });
+        }
+        await reader.cancel().catch(() => {});
+      } else {
+        body = await res.text();
+      }
+    } catch (error) {
+      body += `\n[read error] ${error instanceof Error ? error.message : String(error)}`;
+    }
+    return {
+      payload,
       status: res.status,
       contentType,
       bodyLength: body.length,

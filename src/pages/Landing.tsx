@@ -32,7 +32,7 @@ const STEPS = [
   {
     icon: TerminalSquare,
     title: "Kirim pesan",
-    body: "Chat dengan Agent Mode langsung dari browser, respons mengalir real-time.",
+    body: "Chat dibuat lewat create-chat — tanpa GitHub — lalu jawaban agent dibuka di halaman arena.ai-mu.",
   },
 ];
 
@@ -49,8 +49,8 @@ const FEATURES = [
   },
   {
     icon: Zap,
-    title: "Repo target fleksibel",
-    body: "Pilih repo GitHub tujuan dari dashboard — ID repo diambil otomatis dari GitHub, tanpa perlu Keys.",
+    title: "Tanpa GitHub",
+    body: "Mode chat biasa (create-chat) tidak butuh repo atau koneksi GitHub — cukup cookie arena.ai.",
   },
 ];
 
@@ -86,11 +86,10 @@ function TerminalMock() {
         </p>
         <p className="text-muted-foreground">   message: &apos;halo tes&apos;</p>
         <p className="text-emerald-400">
-          ⏳ streaming respons…{" "}
-          <span className="ml-0.5 inline-block h-3.5 w-2 animate-pulse bg-emerald-400 align-middle" />
+          ✅ HTTP 200 — Session dibuat: 019f…a46b
         </p>
         <p className="text-muted-foreground">
-          data: halo! aku agent arena.ai, siap bantu…
+          🎬 Buka jawabannya: arena.ai/agent/019f…a46b
         </p>
       </div>
     </div>
@@ -173,7 +172,7 @@ export default function Landing() {
             className="mt-5 max-w-xl text-base leading-relaxed text-muted-foreground sm:text-lg"
           >
             Login cukup dengan cookie arena.ai — lalu kirim pesan ke Agent Mode
-            dan lihat responsnya mengalir real-time, persis seperti menjalankan{" "}
+            dan chat dibuat otomatis tanpa GitHub, persis seperti menjalankan{" "}
             <code className="rounded bg-black/40 px-1.5 py-0.5 font-mono text-[13px] text-emerald-300">
               arena_agent_test.py
             </code>
