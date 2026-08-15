@@ -8,7 +8,7 @@ import {
   missingAuthCookies,
   SAMPLE_COOKIE,
 } from "@/lib/arena-cookie";
-import { useAction } from "convex/react";
+import { useAction, useMutation } from "convex/react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -22,15 +22,22 @@ import {
   KeyRound,
   Loader2,
   Lock,
+  LogOut,
   Mail,
   ShieldCheck,
   Sparkles,
   TerminalSquare,
   TriangleAlert,
   UserPlus,
+  Zap,
 } from "lucide-react";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
+
+const CONVEX_SITE_URL = (import.meta.env.VITE_CONVEX_URL as string).replace(
+  /\.cloud$/,
+  ".site",
+);
 
 function resolveRedirect(returnTo: string | null, fallback = "/dashboard") {
   if (returnTo?.startsWith("/") && !returnTo.startsWith("//")) {
@@ -69,9 +76,10 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
   const [searchParams, setSearchParams] = useSearchParams();
   const redirect = resolveRedirect(searchParams.get("returnTo"), redirectAfterAuth);
 
-  const { signIn, isAuthenticated } = useAuth();
+  const { signIn, signOut, isAuthenticated } = useAuth();
   const login = useAction(api.arena.login);
   const registerTemp = useAction(api.arena.registerTempAccount);
+  const logout = useMutation(api.arenaSession.logout);
 
   const { clientId, session, isLoading: sessionLoading } = useArenaSession();
 
@@ -112,6 +120,7 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
   const [copiedBookmarklet, setCopiedBookmarklet] = useState(false);
   const [isRegistering, setIsRegistering] = useState(false);
   const [registerError, setRegisterError] = useState<string | null>(null);
+  const [copiedAuto, setCopiedAuto] = useState(false);
 
   const detected = useMemo(() => detectedCookieNames(cookie), [cookie]);
   const missing = useMemo(() => missingAuthCookies(cookie), [cookie]);
@@ -287,6 +296,33 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
     }
   };
 
+  // Bookmarklet auto-connect: URL-nya unik per browser (clientId sudah
+  // terkunci), jadi sekali disalin cukup untuk browser ini selamanya.
+  const autoConnectBookmarklet = `javascript:(async()=>{const c=document.cookie;if(!c){alert("Tidak ada cookie ditemukan. Login dulu di arena.ai.");return}try{const r=await fetch("${CONVEX_SITE_URL}/arena/connect-cookie",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({clientId:"${clientId}",cookie:c})});const j=await r.json();if(j&&j.ok){alert("Sesi arena tersambung! Buka kembali aplikasi.")}else{alert("Gagal tersambung: "+(j&&(j.body||j.error)||("HTTP "+r.status)))}catch(e){alert("Gagal menghubungi aplikasi: "+e.message)}})()`;
+
+  const copyAutoConnect = async () => {
+    try {
+      await navigator.clipboard.writeText(autoConnectBookmarklet);
+      setCopiedAuto(true);
+      setTimeout(() => setCopiedAuto(false), 2000);
+    } catch {
+      // abaikan — user bisa salin manual dari <code>
+    }
+  };
+
+  // Keluar dari web (akun app) + lepas sesi arena browser ini.
+  const handleSignOut = async () => {
+    try {
+      await logout({ clientId });
+    } catch {
+      // abaikan — sesi arena mungkin belum tersambung
+    }
+    if (isAuthenticated) {
+      await signOut();
+    }
+    navigate("/");
+  };
+
   const methodButton = (active: boolean) =>
     `flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
       active
@@ -315,21 +351,33 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
 
         {/* Sudah masuk ke web? */}
         {isAuthenticated && (
-          <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3">
             <p className="flex items-center gap-2 text-sm text-emerald-300">
               <ShieldCheck className="size-4 shrink-0" />
               Kamu sudah masuk ke web ini.
             </p>
-            <Button
-              asChild
-              size="sm"
-              className="shrink-0 bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
-            >
-              <Link to={redirect}>
-                Ke Dashboard
-                <ArrowRight className="size-4" />
-              </Link>
-            </Button>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button
+                asChild
+                size="sm"
+                className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+              >
+                <Link to={redirect}>
+                  Ke Dashboard
+                  <ArrowRight className="size-4" />
+                </Link>
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleSignOut}
+                className="border-white/10 text-muted-foreground hover:text-foreground"
+              >
+                <LogOut className="size-4" />
+                Keluar
+              </Button>
+            </div>
           </div>
         )}
 
@@ -747,6 +795,43 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
               </Button>
             </form>
 
+            {/* Koneksi otomatis: bookmarklet auto-connect */}
+            <div className="mt-6 rounded-2xl border border-emerald-500/20 bg-emerald-500/5 p-5 text-sm">
+              <p className="mb-1 flex items-center gap-2 font-medium">
+                <Zap className="size-4 text-emerald-400" />
+                Koneksi otomatis: bookmarklet “ARENA AUTO-CONNECT”
+              </p>
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                Pasang bookmarklet ini sekali — URL-nya sudah unik untuk browser
+                ini (clientId terkunci). Tiap kali kamu di arena.ai/agent
+                (sudah login), klik bookmark → seluruh cookie terkirim otomatis
+                ke server → kembali ke sini, sesi langsung tersambung tanpa
+                menempel manual.
+              </p>
+              <div className="mt-3 flex items-start gap-2">
+                <code className="max-h-24 flex-1 overflow-y-auto rounded-lg border border-white/10 bg-black/40 px-3 py-2 font-mono text-[10px] leading-relaxed text-emerald-300">
+                  {autoConnectBookmarklet}
+                </code>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={copyAutoConnect}
+                  className="shrink-0 border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 hover:text-emerald-300"
+                >
+                  {copiedAuto ? "Tersalin ✓" : "Salin"}
+                </Button>
+              </div>
+              <ol className="mt-3 list-decimal space-y-1 pl-5 text-[11px] leading-relaxed text-muted-foreground">
+                <li>Klik “Salin” → buat bookmark baru → tempel sebagai alamat (URL).</li>
+                <li>Buka arena.ai/agent, pastikan sudah login.</li>
+                <li>
+                  Klik bookmark → muncul konfirmasi “Sesi arena tersambung”.
+                </li>
+                <li>Kembali ke aplikasi ini — dashboard langsung siap dipakai.</li>
+              </ol>
+            </div>
+
             {/* Buat akun tes otomatis */}
             <div className="mt-6 rounded-2xl border border-emerald-500/20 bg-emerald-500/5 p-5 text-sm">
               <div className="flex items-center justify-between gap-3">
@@ -791,7 +876,7 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
             <div className="mt-6 rounded-2xl border border-white/10 bg-card/40 p-5 text-sm">
               <p className="mb-3 flex items-center gap-2 font-medium">
                 <CheckCircle2 className="size-4 text-emerald-400" />
-                Cara ambil cookie (harus lengkap)
+                Cara manual ambil cookie (kalau tidak pakai bookmarklet di atas)
               </p>
               <ol className="list-decimal space-y-1.5 pl-5 text-xs leading-relaxed text-muted-foreground">
                 <li>

@@ -107,12 +107,13 @@ export default function Dashboard() {
             <Button
               type="button"
               variant="ghost"
-              size="icon-sm"
-              className="text-muted-foreground hover:text-foreground"
+              size="sm"
+              className="gap-1.5 text-muted-foreground hover:text-foreground"
               onClick={handleSignOut}
               title="Keluar"
             >
               <LogOut className="size-4" />
+              <span className="hidden sm:inline">Keluar</span>
             </Button>
           </div>
         </header>
@@ -296,12 +297,13 @@ export default function Dashboard() {
             <Button
               type="button"
               variant="ghost"
-              size="icon-sm"
-              className="text-muted-foreground hover:text-foreground"
+              size="sm"
+              className="gap-1.5 text-muted-foreground hover:text-foreground"
               onClick={handleSignOut}
               title="Keluar"
             >
               <LogOut className="size-4" />
+              <span className="hidden sm:inline">Keluar</span>
             </Button>
           </div>
         </div>

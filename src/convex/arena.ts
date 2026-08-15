@@ -323,6 +323,49 @@ export const streamChat = httpAction(async (ctx, request) => {
 });
 
 /**
+ * Endpoint yang dipanggil bookmarklet "ARENA AUTO-CONNECT" dari halaman
+ * arena.ai: menerima cookie sesi + clientId, divalidasi ke /api/me, lalu
+ * disimpan — tanpa perlu menempel manual. CORS terbuka supaya bisa dipanggil
+ * lintas origin (arena.ai -> aplikasi).
+ */
+export const connectCookie = httpAction(async (ctx, request) => {
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+  if (request.method !== "POST") {
+    return jsonResponse({ error: "Method not allowed" }, 405);
+  }
+
+  let body: { clientId?: string; cookie?: string };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+  const clientId = body.clientId?.trim();
+  const cookie = body.cookie?.trim();
+  if (!clientId || !cookie) {
+    return jsonResponse(
+      { error: "clientId dan cookie wajib diisi." },
+      400,
+    );
+  }
+
+  try {
+    const result = await ctx.runAction(api.arena.login, { clientId, cookie });
+    return jsonResponse(result, result.ok ? 200 : 400);
+  } catch (error) {
+    return jsonResponse(
+      {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      },
+      502,
+    );
+  }
+});
+
+/**
  * Buat akun arena.ai otomatis via email sementara (mail.tm) lalu simpan
  * sesinya untuk clientId ini. Alur yang dipakai (sudah terbukti):
  *   anon sign-up -> magic-link -> callback -> set-password -> sesi v1.0/v1.1
