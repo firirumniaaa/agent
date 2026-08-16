@@ -120,6 +120,7 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
   const [copiedBookmarklet, setCopiedBookmarklet] = useState(false);
   const [isRegistering, setIsRegistering] = useState(false);
   const [registerError, setRegisterError] = useState<string | null>(null);
+  const [registerDebug, setRegisterDebug] = useState<Record<string, unknown> | null>(null);
   const [copiedAuto, setCopiedAuto] = useState(false);
 
   const detected = useMemo(() => detectedCookieNames(cookie), [cookie]);
@@ -276,14 +277,19 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
   const handleRegisterTemp = async () => {
     setIsRegistering(true);
     setRegisterError(null);
+    setRegisterDebug(null);
     try {
       const result = await registerTemp({ clientId });
       if (result.ok) {
         navigate(redirect, { replace: true });
       } else {
+        const res = result as unknown as Record<string, unknown>;
+        const steps = (res.steps ?? {}) as Record<string, unknown>;
+        const step = (name: string) => steps[name] ?? "?";
+        setRegisterDebug(res);
         setRegisterError(
-          result.error ||
-            `Gagal membuat akun (signup=${result.steps.signup ?? "?"}, setPassword=${result.steps.setPassword ?? "?"}, me=${result.steps.me ?? "?"}, chatAuth=${result.steps.chatAuth ?? "?"}). Coba lagi, atau tempel cookie manual di atas.`,
+          (typeof res.error === "string" && res.error) ||
+            `Gagal menyiapkan sesi Agent Mode (signup=${step("signup")}, setPassword=${step("setPassword")}, meBeforeWarmup=${step("meBeforeWarmup")}, homeWarmup=${step("homeWarmup")}, agentWarmup=${step("agentWarmup")}, meAfterWarmup=${step("meAfterWarmup")}, chatAuth=${step("chatAuth")}). Coba lagi, atau tempel cookie manual di atas.`,
         );
       }
     } catch (err) {
@@ -870,6 +876,16 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
                 <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2.5 text-xs leading-relaxed text-red-300">
                   {registerError}
                 </div>
+              )}
+              {registerDebug && (
+                <details className="mt-3 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
+                  <summary className="cursor-pointer font-medium text-emerald-300/80">
+                    Debug alur akun tes (status per langkah)
+                  </summary>
+                  <pre className="mt-2 overflow-x-auto whitespace-pre-wrap font-mono text-[10px]">
+                    {JSON.stringify(registerDebug, null, 2)}
+                  </pre>
+                </details>
               )}
             </div>
 

@@ -1,6 +1,7 @@
 import { ConvexError, v } from "convex/values";
 import { api, internal } from "./_generated/api";
 import { action, httpAction } from "./_generated/server";
+import { syntheticQaIdentity } from "./arenaTempAccount";
 
 const BASE = "https://arena.ai";
 const READ_MS = 120_000; // sama seperti READ_SECONDS = 120 di script
@@ -381,44 +382,39 @@ export const registerTempAccount = action({
       api.arenaTempAccount.createTempAccount,
       { clientId },
     )) as Record<string, unknown>;
-    const log = (result.log as Array<Record<string, unknown>> | undefined) ?? [];
-    const step = (name: string) =>
-      log.find((l) => l.step === name) ?? null;
-    const signup = step("signup-anon");
-    const setPassword = step("set-password");
-    const me = step("me");
-    const chat = step("chat-real-token");
-    const chatAuth =
-      typeof result.chatAuth === "number"
-        ? result.chatAuth
-        : chat?.status ?? null;
+    const steps = (result.steps ?? {}) as Record<string, unknown>;
+    const chatAuth = typeof steps.chatAuth === "number" ? steps.chatAuth : null;
     const hasV10 = Boolean(result.hasV10);
     const hasV11 = Boolean(result.hasV11);
-    const cookieNames = Array.isArray(result.cookieNames)
-      ? (result.cookieNames as string[])
-      : [];
-    const steps = {
-      signup: signup?.status ?? null,
-      setPassword: setPassword?.status ?? null,
-      me: me?.status ?? null,
-      chatAuth,
-    };
 
     // ok:true HANYA kalau create-chat dengan token reCAPTCHA 200/201 DAN
     // cookie sesi lengkap (v1.0 + v1.1). Kalau chatAuth masih 403 atau v1.1
-    // hilang, sesi belum layak dipakai — laporkan jujur.
+    // hilang, sesi belum layak dipakai — laporkan jujur beserta debug-nya.
     const ok = (chatAuth === 200 || chatAuth === 201) && hasV10 && hasV11;
+    const base = {
+      ok,
+      error: null as string | null,
+      hasV10,
+      hasV11,
+      cookieNames: Array.isArray(result.cookieNames)
+        ? (result.cookieNames as string[])
+        : [],
+      steps,
+      finalUrls: result.finalUrls ?? null,
+      statusTexts: result.statusTexts ?? null,
+      responsePreview: result.responsePreview ?? null,
+      address: typeof result.address === "string" ? result.address : null,
+    };
     if (!ok) {
       return {
-        ok: false as const,
-        error: "Arena temp account created, but Agent Mode session is not ready",
-        hasV10,
-        hasV11,
-        cookieNames,
-        steps,
+        ...base,
+        error:
+          typeof result.error === "string" && result.error
+            ? result.error
+            : "Arena temp account created, but Agent Mode session is not ready",
       };
     }
-    return { ok: true as const, hasV10, hasV11, cookieNames, steps };
+    return base;
   },
 });
 
@@ -722,15 +718,6 @@ export const debugAuth = action({
 
 const MAIL_TM = "https://api.mail.tm";
 
-function randomAddress(): string {
-  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let s = "arena";
-  for (let i = 0; i < 10; i++) {
-    s += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return `${s}@emalupe.com`;
-}
-
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -817,8 +804,8 @@ function b64UrlEncode(s: string): string {
 export const debugTempSignup = action({
   args: {},
   handler: async (): Promise<Record<string, unknown>> => {
-    // 1) Buat mailbox sementara
-    const address = randomAddress();
+    // 1) Buat mailbox sementara — identitas QA sintetis (bukan orang asli)
+    const { fullName, address } = await syntheticQaIdentity();
     const password = "TempPass!" + Math.random().toString(36).slice(2, 10);
     let createRes: Response;
     try {
@@ -838,7 +825,7 @@ export const debugTempSignup = action({
     // 2) Kirim magic-link arena
     const signupPayload = {
       email: address,
-      fullName: "Test Arena",
+      fullName,
       shouldLinkHistory: false,
       marketingConsent: false,
       registeredCountryCode: "ID",
@@ -860,7 +847,8 @@ export const debugTempSignup = action({
       return { address, error: `magic-link fetch gagal: ${String(error)}` };
     }
     const magicBody = (await magicRes.text()).slice(0, 300);
-    return { address, password, magicStatus: magicRes.status, magicBody };
+    // Password TIDAK dikembalikan — hanya status + identitas QA sintetis.
+    return { address, magicStatus: magicRes.status, magicBody };
   },
 });
 
@@ -1205,7 +1193,7 @@ export const debugTempSessionTest = action({
 export const debugSignupDirect = action({
   args: {},
   handler: async (): Promise<Record<string, unknown>> => {
-    const address = randomAddress();
+    const { address } = await syntheticQaIdentity();
     const password = "TempPass!" + Math.random().toString(36).slice(2, 10);
     const token = await mintRecaptchaToken();
     if (!token) return { error: "token recaptcha gagal" };
@@ -1489,7 +1477,7 @@ export const debugSignupReverse = action({
     { doSetPassword, message },
   ): Promise<Record<string, unknown>> => {
     // 1) Mailbox sementara baru
-    const address = randomAddress();
+    const { address } = await syntheticQaIdentity();
     const password = "TempPass!" + Math.random().toString(36).slice(2, 10);
     try {
       const createRes = await fetch(`${MAIL_TM}/accounts`, {
