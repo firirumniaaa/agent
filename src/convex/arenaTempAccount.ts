@@ -1,73 +1,7 @@
 import { action } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { v } from "convex/values";
-
-/**
- * ===== Cookie jar =====
- *
- * Jangan pernah cuma membaca `response.headers.get("set-cookie")` — itu sering
- * hanya berisi sebagian atau format gabungan yang susah di-parse (Expires
- * memuat koma). Yang benar: pakai `getSetCookie()` (tersedia di Node 18+ /
- * runtime Convex) yang mengembalikan SATU STRING PER COOKIE, lalu merge semua
- * pasangan ke jar (Map name -> value, name terakhir menang).
- */
-
-/** Pecah SEMUA header Set-Cookie dari response (bukan cuma cookie pertama). */
-function collectSetCookies(res: Response): string[] {
-  const headers = res.headers as Headers & { getSetCookie?: () => string[] };
-  if (typeof headers.getSetCookie === "function") {
-    return headers
-      .getSetCookie()
-      .map((c: string) => c.split(";")[0].trim())
-      .filter(Boolean);
-  }
-  // Fallback manual: header "set-cookie" bisa menggabungkan beberapa cookie
-  // dengan koma — koma hanya pemisah kalau bukan bagian dari Expires=
-  // (perilaku set-cookie-parser.splitCookiesString).
-  const header = headers.get("set-cookie") ?? "";
-  const parts: string[] = [];
-  let current = "";
-  let i = 0;
-  while (i < header.length) {
-    const ch = header[i];
-    if (ch === ",") {
-      const tail = current.slice(current.lastIndexOf(";") + 1);
-      if (!/expires=/i.test(tail)) {
-        parts.push(current.trim());
-        current = "";
-        i++;
-        continue;
-      }
-    }
-    current += ch;
-    i++;
-  }
-  if (current.trim()) parts.push(current.trim());
-  return parts.map((c) => c.split(";")[0].trim()).filter(Boolean);
-}
-
-/**
- * Merge SEMUA pasangan Set-Cookie dari response ke jar. Harus dipanggil
- * setelah TIAP request penting: signup, magic-link, callback, set-password,
- * /me, chat — supaya sesi akhir lengkap (v1.0 + v1.1 + cookie pendukung).
- */
-function mergeResponseCookies(
-  jar: Map<string, string>,
-  res: Response,
-): Map<string, string> {
-  for (const pair of collectSetCookies(res)) {
-    const eq = pair.indexOf("=");
-    if (eq > 0) jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
-  }
-  return jar;
-}
-
-/** Bangun header Cookie dari jar. */
-function cookieHeader(jar: Map<string, string>): string {
-  return Array.from(jar.entries())
-    .map(([k, v]) => `${k}=${v}`)
-    .join("; ");
-}
+import { CookieJar, fetchWithJar, followRedirectsWithJar } from "./cookieJar";
 
 const BASE = "https://arena.ai";
 const MAIL_TM = "https://api.mail.tm";
@@ -119,17 +53,18 @@ function randomAddress(): string {
 }
 
 /**
- * Alur upgrade anonim -> email via magic-link, persis urutan browser:
- * anon sign-up -> magic-link (dengan cookie anon) -> callback -> set-password
- * -> cek /api/me + create-chat.
+ * Buat akun arena.ai otomatis via email sementara (mail.tm) lalu simpan
+ * sesinya untuk clientId ini. Alur persis urutan browser:
+ *   anon sign-up -> magic-link -> callback (redirect manual) -> set-password
+ *   -> /api/me -> create-chat.
  *
- * Kunci: SEMUA Set-Cookie dari setiap request di-merge ke jar
- * (getSetCookie, bukan cuma cookie pertama), jadi sesi akhir lengkap
- * (arena-auth-prod-v1.0 + v1.1 + cookie pendukung).
+ * SEMUA Set-Cookie di-merge ke CookieJar setelah tiap request penting
+ * (getSetCookie / raw / split aman — lihat cookieJar.ts), dan setiap request
+ * berikutnya mengirim jar terbaru. Sesi akhir harus punya v1.0 + v1.1.
  *
- * Hasil akhir melaporkan `hasV10`, `hasV11`, dan `chatAuth` (status
- * create-chat dengan token reCAPTCHA). Sesi disimpan HANYA kalau /api/me 200
- * — supaya tidak menimpa sesi user yang sudah terhubung dengan sesi rusak.
+ * KEAMANAN DEBUG: tidak pernah mengembalikan/melog cookie mentah, token,
+ * password, atau body respons yang bisa memuat token — hanya status + nama
+ * cookie.
  */
 export const createTempAccount = action({
   args: { clientId: v.optional(v.string()) },
@@ -153,67 +88,67 @@ export const createTempAccount = action({
       return { error: `mail.tm create gagal: ${String(error)}`, address };
     }
 
-    // 2) Kunjungan pertama -> provisional_user_id (jar mulai diisi dari /agent)
-    const jar = new Map<string, string>();
-    const visitRes = await fetch(`${BASE}/agent`, {
+    // 2) Kunjungan /agent -> provisional_user_id (Set-Cookie masuk jar)
+    const jar = CookieJar.empty();
+    const visitRes = await fetchWithJar(jar, `${BASE}/agent`, {
       headers: { "User-Agent": UA, Accept: "text/html" },
-      redirect: "manual",
       signal: AbortSignal.timeout(15_000),
     });
-    mergeResponseCookies(jar, visitRes);
     const provisionalUserId = jar.get("provisional_user_id") ?? "";
-    log.push({ step: "visit", status: visitRes.status, provisionalUserId });
+    log.push({
+      step: "visit",
+      status: visitRes.status,
+      provisionalUserId,
+      cookieNames: jar.names(),
+    });
 
     // 3) sign-up ANONIM
     const recaptchaToken = await mintRecaptchaToken();
     if (!recaptchaToken) return { error: "recaptcha token gagal", address };
-    const suRes = await fetch(`${BASE}/nextjs-api/sign-up`, {
+    const suRes = await fetchWithJar(jar, `${BASE}/nextjs-api/sign-up`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "User-Agent": UA,
         Origin: BASE,
         Referer: BASE + "/agent",
-        Cookie: cookieHeader(jar),
       },
       body: JSON.stringify({ recaptchaToken, provisionalUserId }),
       signal: AbortSignal.timeout(20_000),
     });
-    const suBody = await suRes.text();
-    mergeResponseCookies(jar, suRes);
     log.push({
       step: "signup-anon",
       status: suRes.status,
-      setCookies: collectSetCookies(suRes).map((c) => c.split("=")[0]),
-      body: suBody.slice(0, 150),
+      cookieNames: jar.names(),
     });
     if (suRes.status !== 200) return { address, log };
 
-    // 4) magic-link dengan cookie anon — MERGE Set-Cookie response juga
-    const mlRes = await fetch(`${BASE}/nextjs-api/sign-up/magic-link`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": UA,
-        Origin: BASE,
-        Referer: BASE + "/agent",
-        Cookie: cookieHeader(jar),
+    // 4) magic-link dengan cookie anon (Set-Cookie response ikut di-merge)
+    const mlRes = await fetchWithJar(
+      jar,
+      `${BASE}/nextjs-api/sign-up/magic-link`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": UA,
+          Origin: BASE,
+          Referer: BASE + "/agent",
+        },
+        body: JSON.stringify({
+          email: address,
+          fullName: "Test Arena",
+          shouldLinkHistory: false,
+          marketingConsent: false,
+          registeredCountryCode: "US",
+        }),
+        signal: AbortSignal.timeout(20_000),
       },
-      body: JSON.stringify({
-        email: address,
-        fullName: "Test Arena",
-        shouldLinkHistory: false,
-        marketingConsent: false,
-        registeredCountryCode: "US",
-      }),
-      signal: AbortSignal.timeout(20_000),
-    });
-    mergeResponseCookies(jar, mlRes);
+    );
     log.push({
       step: "magic-link",
       status: mlRes.status,
-      setCookies: collectSetCookies(mlRes).map((c) => c.split("=")[0]),
-      body: (await mlRes.text()).slice(0, 200),
+      cookieNames: jar.names(),
     });
 
     // 5) Token mail.tm + poll inbox sampai email callback tiba
@@ -269,112 +204,75 @@ export const createTempAccount = action({
     });
     if (!callbackUrl) return { address, log };
 
-    // 6) Follow callback redirect — merge cookie tiap hop + ambil token set-password
-    let current = callbackUrl;
-    let setPasswordToken = "";
-    const hops = [];
-    for (let i = 0; i < 6; i++) {
-      const r = await fetch(current, {
-        redirect: "manual",
+    // 6) Callback: ikuti redirect MANUAL (redirect:"manual" + Location sendiri)
+    //    sambil merge Set-Cookie dari SETIAP hop — seperti perilaku browser.
+    const { response: cbRes, hops } = await followRedirectsWithJar(
+      jar,
+      callbackUrl,
+      {
         headers: {
           "User-Agent": UA,
           Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
-          Cookie: cookieHeader(jar),
         },
-        signal: AbortSignal.timeout(15_000),
-      });
-      const loc = r.headers.get("location");
-      mergeResponseCookies(jar, r);
-      hops.push({ hop: i, status: r.status, loc: loc?.slice(0, 80) ?? null });
-      if (loc) {
-        if (loc.includes("/auth/set-password")) {
-          setPasswordToken = loc.match(/token=([^&]+)/)?.[1] ?? "";
-        }
-        current = new URL(loc, current).toString();
-      } else {
-        break;
-      }
-    }
-    log.push({ step: "callback", hops, hasToken: Boolean(setPasswordToken) });
+      },
+      6,
+    );
+    const setPasswordHop = hops.find((h) =>
+      h.location?.includes("/auth/set-password"),
+    );
+    const setPasswordToken =
+      setPasswordHop?.location?.match(/token=([^&]+)/)?.[1] ?? "";
+    log.push({
+      step: "callback",
+      status: cbRes.status,
+      hops,
+      hasToken: Boolean(setPasswordToken),
+      cookieNames: jar.names(),
+    });
     if (!setPasswordToken) return { address, log };
 
     // 7) set-password dengan cookie sesi (anon + provisional baru)
-    const spRes = await fetch(`${BASE}/nextjs-api/auth/set-password`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": UA,
-        Origin: BASE,
-        Referer: BASE + "/agent",
-        Cookie: cookieHeader(jar),
+    const spRes = await fetchWithJar(
+      jar,
+      `${BASE}/nextjs-api/auth/set-password`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": UA,
+          Origin: BASE,
+          Referer: BASE + "/agent",
+        },
+        body: JSON.stringify({ password, token: setPasswordToken }),
+        signal: AbortSignal.timeout(20_000),
       },
-      body: JSON.stringify({ password, token: setPasswordToken }),
-      signal: AbortSignal.timeout(20_000),
-    });
-    const spBody = await spRes.text();
-    mergeResponseCookies(jar, spRes);
-    const spPairs = collectSetCookies(spRes);
+    );
     log.push({
       step: "set-password",
       status: spRes.status,
-      setCookies: spPairs.map((c) => c.split("=")[0]),
-      body: spBody.slice(0, 200),
+      cookieNames: jar.names(),
     });
 
-    // 8) /api/me (merge Set-Cookie kalau ada)
-    const meRes = await fetch(`${BASE}/api/me`, {
+    // 8) /api/me
+    const meRes = await fetchWithJar(jar, `${BASE}/api/me`, {
       headers: {
         "User-Agent": UA,
         Accept: "application/json, text/event-stream, */*",
         Origin: BASE,
         Referer: BASE + "/agent",
-        Cookie: cookieHeader(jar),
       },
       signal: AbortSignal.timeout(15_000),
     });
-    const meBody = await meRes.text();
-    mergeResponseCookies(jar, meRes);
-    log.push({ step: "me", status: meRes.status, body: meBody.slice(0, 300) });
+    log.push({ step: "me", status: meRes.status });
 
     const hasV10 = jar.has("arena-auth-prod-v1.0");
     const hasV11 = jar.has("arena-auth-prod-v1.1");
 
     // 9) Isolasi auth create-chat (token null: 401 = auth gagal, 403 = auth OK)
-    const chatNullRes = await fetch(`${BASE}/nextjs-api/stream/create-chat`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": UA,
-        Accept: "application/json, text/event-stream, */*",
-        Origin: BASE,
-        Referer: BASE + "/agent",
-        Cookie: cookieHeader(jar),
-      },
-      body: JSON.stringify({
-        message: {
-          id: crypto.randomUUID(),
-          role: "user",
-          parts: [{ type: "text", text: "halo tes setelah upgrade email" }],
-        },
-        timezone: "Asia/Jakarta",
-        recaptchaV2Token: null,
-        recaptchaV3Token: null,
-      }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    mergeResponseCookies(jar, chatNullRes);
-    log.push({
-      step: "chat-null-token",
-      status: chatNullRes.status,
-      body: (await chatNullRes.text()).slice(0, 200),
-    });
-
-    // 10) create-chat DENGAN token reCAPTCHA — status inilah yang dipakai
-    //     untuk menentukan ok (200/201 = akun benar-benar bisa chat).
-    let chatAuth = chatNullRes.status;
-    const chatToken = await mintRecaptchaToken();
-    if (chatToken) {
-      const chatRes = await fetch(`${BASE}/nextjs-api/stream/create-chat`, {
+    const chatNullRes = await fetchWithJar(
+      jar,
+      `${BASE}/nextjs-api/stream/create-chat`,
+      {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -382,7 +280,6 @@ export const createTempAccount = action({
           Accept: "application/json, text/event-stream, */*",
           Origin: BASE,
           Referer: BASE + "/agent",
-          Cookie: cookieHeader(jar),
         },
         body: JSON.stringify({
           message: {
@@ -392,44 +289,66 @@ export const createTempAccount = action({
           },
           timezone: "Asia/Jakarta",
           recaptchaV2Token: null,
-          recaptchaV3Token: chatToken,
+          recaptchaV3Token: null,
         }),
-        signal: AbortSignal.timeout(20_000),
-      });
-      chatAuth = chatRes.status;
-      mergeResponseCookies(jar, chatRes);
-      log.push({
-        step: "chat-real-token",
-        status: chatRes.status,
-        body: (await chatRes.text()).slice(0, 200),
-      });
-    } else {
-      log.push({
-        step: "chat-real-token",
-        status: chatAuth,
-        body: "token reCAPTCHA gagal di-mint",
-      });
-    }
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
+    log.push({ step: "chat-null-token", status: chatNullRes.status });
 
-    // Simpan sesi final HANYA kalau /api/me 200 — jangan timpa sesi user yang
-    // sudah terhubung dengan sesi temp yang rusak.
+    // 10) create-chat DENGAN token reCAPTCHA — status inilah yang menentukan
+    //     kesiapan sesi (200/201 = akun benar-benar bisa chat).
+    let chatAuth = chatNullRes.status;
+    const chatToken = await mintRecaptchaToken();
+    if (chatToken) {
+      const chatRes = await fetchWithJar(
+        jar,
+        `${BASE}/nextjs-api/stream/create-chat`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": UA,
+            Accept: "application/json, text/event-stream, */*",
+            Origin: BASE,
+            Referer: BASE + "/agent",
+          },
+          body: JSON.stringify({
+            message: {
+              id: crypto.randomUUID(),
+              role: "user",
+              parts: [{ type: "text", text: "halo tes setelah upgrade email" }],
+            },
+            timezone: "Asia/Jakarta",
+            recaptchaV2Token: null,
+            recaptchaV3Token: chatToken,
+          }),
+          signal: AbortSignal.timeout(20_000),
+        },
+      );
+      chatAuth = chatRes.status;
+    }
+    log.push({ step: "chat-real-token", status: chatAuth });
+
+    // Simpan sesi final HANYA kalau /api/me 200 — jangan menimpa sesi user
+    // yang sudah terhubung dengan sesi temp yang rusak.
     if (meRes.status === 200) {
       const saveClientId = clientId?.trim() || "temp-mail-magiclink";
       await ctx.runMutation(internal.arenaSession.upsert, {
         clientId: saveClientId,
-        cookie: cookieHeader(jar),
+        cookie: jar.header(),
         name: "Temp MagicLink",
         email: address,
       });
     }
 
     return {
-      address,
-      password,
+      ok: chatAuth === 200 || chatAuth === 201,
       hasV10,
       hasV11,
       chatAuth,
-      cookieNames: Array.from(jar.keys()),
+      cookieNames: jar.names(),
+      address,
       log,
     };
   },

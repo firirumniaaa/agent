@@ -392,19 +392,33 @@ export const registerTempAccount = action({
       typeof result.chatAuth === "number"
         ? result.chatAuth
         : chat?.status ?? null;
-    return {
-      ok: chatAuth === 200 || chatAuth === 201,
-      address: typeof result.address === "string" ? result.address : null,
-      password: typeof result.password === "string" ? result.password : null,
-      hasV10: Boolean(result.hasV10),
-      hasV11: Boolean(result.hasV11),
-      steps: {
-        signup: signup?.status ?? null,
-        setPassword: setPassword?.status ?? null,
-        me: me?.status ?? null,
-        chatAuth,
-      },
+    const hasV10 = Boolean(result.hasV10);
+    const hasV11 = Boolean(result.hasV11);
+    const cookieNames = Array.isArray(result.cookieNames)
+      ? (result.cookieNames as string[])
+      : [];
+    const steps = {
+      signup: signup?.status ?? null,
+      setPassword: setPassword?.status ?? null,
+      me: me?.status ?? null,
+      chatAuth,
     };
+
+    // ok:true HANYA kalau create-chat dengan token reCAPTCHA 200/201 DAN
+    // cookie sesi lengkap (v1.0 + v1.1). Kalau chatAuth masih 403 atau v1.1
+    // hilang, sesi belum layak dipakai — laporkan jujur.
+    const ok = (chatAuth === 200 || chatAuth === 201) && hasV10 && hasV11;
+    if (!ok) {
+      return {
+        ok: false as const,
+        error: "Arena temp account created, but Agent Mode session is not ready",
+        hasV10,
+        hasV11,
+        cookieNames,
+        steps,
+      };
+    }
+    return { ok: true as const, hasV10, hasV11, cookieNames, steps };
   },
 });
 

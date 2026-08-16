@@ -282,7 +282,8 @@ function Auth({ redirectAfterAuth = "/dashboard" }: AuthProps) {
         navigate(redirect, { replace: true });
       } else {
         setRegisterError(
-          `Gagal membuat akun (signup=${result.steps.signup ?? "?"}, setPassword=${result.steps.setPassword ?? "?"}, me=${result.steps.me ?? "?"}, chatAuth=${result.steps.chatAuth ?? "?"}). Coba lagi, atau tempel cookie manual di atas.`,
+          result.error ||
+            `Gagal membuat akun (signup=${result.steps.signup ?? "?"}, setPassword=${result.steps.setPassword ?? "?"}, me=${result.steps.me ?? "?"}, chatAuth=${result.steps.chatAuth ?? "?"}). Coba lagi, atau tempel cookie manual di atas.`,
         );
       }
     } catch (err) {
