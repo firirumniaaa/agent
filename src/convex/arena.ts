@@ -367,16 +367,18 @@ export const connectCookie = httpAction(async (ctx, request) => {
 
 /**
  * Buat akun arena.ai otomatis via email sementara (mail.tm) lalu simpan
- * sesinya untuk clientId ini. Alur yang dipakai (sudah terbukti):
+ * sesinya untuk clientId ini. Alur (implementasi di arenaTempAccount.ts):
  *   anon sign-up -> magic-link -> callback -> set-password -> sesi v1.0/v1.1
- * Hasil akhir: /api/me 200 DAN auth create-chat lolos (tinggal token
- * reCAPTCHA dari browser saat chat). Khusus untuk tes — akun email temp.
+ * Semua Set-Cookie di-merge ke cookie jar setelah tiap request penting.
+ * Hasil akhir jujur: ok:true HANYA kalau create-chat dengan token reCAPTCHA
+ * benar-benar 200/201 — kalau chatAuth masih 403, sesi belum layak dipakai.
+ * Khusus untuk tes — akun email temp.
  */
 export const registerTempAccount = action({
   args: { clientId: v.string() },
   handler: async (ctx, { clientId }) => {
     const result = (await ctx.runAction(
-      api.arenaDebug.debugAnonUpgradeViaMagicLink,
+      api.arenaTempAccount.createTempAccount,
       { clientId },
     )) as Record<string, unknown>;
     const log = (result.log as Array<Record<string, unknown>> | undefined) ?? [];
@@ -385,17 +387,22 @@ export const registerTempAccount = action({
     const signup = step("signup-anon");
     const setPassword = step("set-password");
     const me = step("me");
-    const chat = step("chat-null-token");
+    const chat = step("chat-real-token");
+    const chatAuth =
+      typeof result.chatAuth === "number"
+        ? result.chatAuth
+        : chat?.status ?? null;
     return {
-      ok: Boolean(me && (me.status === 200 || me.status === 201)),
+      ok: chatAuth === 200 || chatAuth === 201,
       address: typeof result.address === "string" ? result.address : null,
       password: typeof result.password === "string" ? result.password : null,
       hasV10: Boolean(result.hasV10),
+      hasV11: Boolean(result.hasV11),
       steps: {
         signup: signup?.status ?? null,
         setPassword: setPassword?.status ?? null,
         me: me?.status ?? null,
-        chatAuth: chat?.status ?? null, // 403 = auth lolos, tinggal recaptcha
+        chatAuth,
       },
     };
   },
