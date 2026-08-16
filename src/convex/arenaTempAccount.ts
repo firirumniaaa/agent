@@ -2,6 +2,7 @@ import { action } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import { CookieJar, fetchWithJar, followRedirectsWithJar } from "./cookieJar";
+import { mintArenaRecaptchaToken } from "./arenaRecaptcha";
 
 const BASE = "https://arena.ai";
 const MAIL_TM = "https://api.mail.tm";
@@ -10,10 +11,6 @@ const MAIL_TM = "https://api.mail.tm";
 // seluruh alur (header browser-like, bukan User-Agent iPhone).
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
-
-const RECAPTCHA_KEY = "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0";
-const RECAPTCHA_ORIGIN_B64 = "aHR0cHM6Ly9sbWFyZW5hLmFp";
-const RECAPTCHA_VERSION = "XOqlk8PL_yVx6IdpLbpXdiLy";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -72,32 +69,6 @@ export async function syntheticQaIdentity(): Promise<{
     fullName: pick.fullName,
     address: `${pick.local}.${stamp}@${domain}`,
   };
-}
-
-/** Mint token reCAPTCHA dari anchor (server-side). */
-async function mintRecaptchaToken(): Promise<string | null> {
-  const url =
-    `https://www.google.com/recaptcha/enterprise/anchor?ar=1` +
-    `&k=${RECAPTCHA_KEY}` +
-    `&co=${RECAPTCHA_ORIGIN_B64}` +
-    `&hl=en&v=${RECAPTCHA_VERSION}&size=invisible&cb=${Math.random().toString(36).slice(2)}`;
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": BROWSER_UA,
-        Origin: "https://lmarena.ai",
-        Referer: "https://lmarena.ai/",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      },
-      signal: AbortSignal.timeout(15_000),
-    });
-    const html = await res.text();
-    const m = html.match(/id="recaptcha-token" value="([^"]+)"/);
-    return m?.[1] ?? null;
-  } catch {
-    return null;
-  }
 }
 
 /** Scrub nilai mirip token/JWT dari teks debug sebelum dikembalikan. */
@@ -236,7 +207,7 @@ export const createTempAccount = action({
     }
 
     // 3) sign-up ANONIM
-    const recaptchaToken = await mintRecaptchaToken();
+    const recaptchaToken = await mintArenaRecaptchaToken();
     if (!recaptchaToken) {
       error = "recaptcha token gagal";
       return finish();
@@ -400,7 +371,7 @@ export const createTempAccount = action({
 
     // 12) create-chat DENGAN token reCAPTCHA — status inilah yang menentukan
     //     kesiapan sesi (200/201 = akun benar-benar bisa chat).
-    const chatToken = await mintRecaptchaToken();
+    const chatToken = await mintArenaRecaptchaToken();
     if (chatToken) {
       const chatReal = await createChatWithJar(jar, chatToken);
       steps.chatAuth = chatReal.status;

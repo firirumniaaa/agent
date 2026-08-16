@@ -2,6 +2,7 @@ import { ConvexError, v } from "convex/values";
 import { api, internal } from "./_generated/api";
 import { action, httpAction } from "./_generated/server";
 import { syntheticQaIdentity } from "./arenaTempAccount";
+import { mintArenaRecaptchaToken } from "./arenaRecaptcha";
 
 const BASE = "https://arena.ai";
 const READ_MS = 120_000; // sama seperti READ_SECONDS = 120 di script
@@ -520,34 +521,11 @@ export const debugChat = action({
   },
 });
 
-// ====== DEBUG: bypass reCAPTCHA via anchor protocol (origin lmarena.ai) ======
+// ====== DEBUG: bypass reCAPTCHA — token di-mint untuk origin arena.ai dengan
+// cookie jar Google lengkap (lihat arenaRecaptcha.ts) ======
 
-const RECAPTCHA_KEY = "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0";
-const RECAPTCHA_ORIGIN = "https://lmarena.ai";
-const RECAPTCHA_ORIGIN_B64 = "aHR0cHM6Ly9sbWFyZW5hLmFp";
-const RECAPTCHA_VERSION = "XOqlk8PL_yVx6IdpLbpXdiLy";
-
-const RECAPTCHA_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
-
-async function mintRecaptchaToken(extra = ""): Promise<string | null> {
-  const url =
-    `https://www.google.com/recaptcha/enterprise/anchor?ar=1` +
-    `&k=${RECAPTCHA_KEY}` +
-    `&co=${RECAPTCHA_ORIGIN_B64}` +
-    `&hl=en&v=${RECAPTCHA_VERSION}&size=invisible&cb=${Math.random().toString(36).slice(2)}${extra}`;
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": RECAPTCHA_UA,
-      Origin: RECAPTCHA_ORIGIN,
-      Referer: RECAPTCHA_ORIGIN + "/",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    },
-    signal: AbortSignal.timeout(15_000),
-  });
-  const html = await res.text();
-  const m = html.match(/id="recaptcha-token" value="([^"]+)"/);
-  return m?.[1] ?? null;
+async function mintRecaptchaToken(_extra = ""): Promise<string | null> {
+  return mintArenaRecaptchaToken();
 }
 
 async function createChatWithCookie(
@@ -626,6 +604,46 @@ export const debugBypass = action({
       });
     }
     return { tokenLength: token.length, results };
+  },
+});
+
+// Tes token hasil minting BARU (arena.ai origin + cookie Google lengkap)
+// terhadap sesi tersimpan — untuk verifikasi apakah chatAuth jadi 200.
+export const debugRecaptchaArena = action({
+  args: {},
+  handler: async (ctx): Promise<Record<string, unknown>> => {
+    const session: FirstSession = await ctx.runQuery(
+      internal.arenaSession.firstSession,
+      {},
+    );
+    if (!session) {
+      return { error: "Tidak ada sesi tersimpan di Convex. Login atau buat akun tes dulu." };
+    }
+    const token = await mintArenaRecaptchaToken();
+    if (!token) {
+      return { error: "Gagal mint token recaptcha (anchor/reload tidak menghasilkan token)." };
+    }
+    const results = [];
+    for (const origin of ["https://arena.ai", "https://lmarena.ai", ""]) {
+      try {
+        const res = await createChatWithCookie(
+          session.cookie,
+          token,
+          "halo, tes token recaptcha baru (arena origin + cookie jar)",
+          origin,
+        );
+        results.push({ variant: origin || "no-origin", status: res.status, body: res.body });
+      } catch (error) {
+        results.push({ variant: origin || "no-origin", error: String(error) });
+      }
+    }
+    return {
+      sessionClientId: session.clientId,
+      sessionUser: session.email ?? session.name,
+      tokenLength: token.length,
+      tokenPrefix: token.slice(0, 12),
+      results,
+    };
   },
 });
 

@@ -1,6 +1,7 @@
 import { action } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { v } from "convex/values";
+import { mintArenaRecaptchaToken } from "./arenaRecaptcha";
 
 /** Pecah Set-Cookie jadi pasangan bersih (getSetCookie). */
 function collectSetCookies(res: Response): string[] {
@@ -346,37 +347,12 @@ function b64UrlDecode(s: string): string {
 }
 
 const MAIL_TM = "https://api.mail.tm";
-const RECAPTCHA_KEY = "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0";
-const RECAPTCHA_ORIGIN_B64 = "aHR0cHM6Ly9sbWFyZW5hLmFp";
-const RECAPTCHA_VERSION = "XOqlk8PL_yVx6IdpLbpXdiLy";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Mint token reCAPTCHA dari anchor (server-side). */
+/** Mint token reCAPTCHA — origin arena.ai + cookie Google lengkap (arenaRecaptcha.ts). */
 async function mintRecaptchaToken(): Promise<string | null> {
-  const url =
-    `https://www.google.com/recaptcha/enterprise/anchor?ar=1` +
-    `&k=${RECAPTCHA_KEY}` +
-    `&co=${RECAPTCHA_ORIGIN_B64}` +
-    `&hl=en&v=${RECAPTCHA_VERSION}&size=invisible&cb=${Math.random().toString(36).slice(2)}`;
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        Origin: "https://lmarena.ai",
-        Referer: "https://lmarena.ai/",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      },
-      signal: AbortSignal.timeout(15_000),
-    });
-    const html = await res.text();
-    const m = html.match(/id="recaptcha-token" value="([^"]+)"/);
-    return m?.[1] ?? null;
-  } catch {
-    return null;
-  }
+  return mintArenaRecaptchaToken();
 }
 
 function randomAddress(): string {
